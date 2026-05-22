@@ -1,0 +1,13 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Built app bundle (produced by build.sh)
+*.app/
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+
+# macOS
+.DS_Store
