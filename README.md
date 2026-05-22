@@ -4,6 +4,8 @@ A tiny macOS menu bar app that shows, at a glance, whether something is
 deliberately keeping your Mac awake — with first-class awareness of the
 Claude Code CLI.
 
+![AwakeBar showing the menu bar dropdown next to a Claude Code session](awakebar.webp)
+
 ## What it shows
 
 A coffee cup in the menu bar:
@@ -12,16 +14,19 @@ A coffee cup in the menu bar:
 - **💤 empty** — the Mac can sleep normally
 
 The dropdown lists the responsible processes and always shows a dedicated
-**Claude Code hook** line — `keeping the Mac awake now` during a Claude turn,
-`idle (last active 30s ago)` between turns:
+**Claude Code hook** line — `Claude is working` during a turn,
+`holding for a remote session` when a Remote Control session keeps the Mac
+awake between turns, `idle (last active 30s ago)` otherwise — plus a live
+**Remote control** line:
 
 ```
 ☕ Mac is being kept awake
 ──────────────
-Claude Code hook: keeping the Mac awake now
+Claude Code hook: holding for a remote session
+Remote control: active
 ──────────────
 Kept awake by:
-   • caffeinate (Claude Code hook)
+   caffeinate (Claude Code hook)
 ──────────────
 Open at Login
 Quit AwakeBar
@@ -49,8 +54,10 @@ installed copy in sync on every rebuild.
 ## The Claude Code hook (optional)
 
 `keep-awake.sh` is the paired Claude Code hook: it runs a `caffeinate` while
-Claude is working and stops it when the turn ends. Install it by copying the
-script to `~/.claude/` (and `chmod +x` it), then wiring it into
+Claude is working and stops when the turn ends — and for a **Remote Control**
+session it keeps the Mac awake *between* turns too, so a session driven from
+claude.ai or mobile isn't killed by the Mac sleeping. Install it by copying
+the script to `~/.claude/` (and `chmod +x` it), then wiring it into
 `~/.claude/settings.json`:
 
 ```json

@@ -1,5 +1,6 @@
 import Cocoa
 import ServiceManagement
+import Darwin   // kill(2), for the session liveness check
 
 // MARK: - Monitor
 //
@@ -22,10 +23,21 @@ final class AwakeMonitor {
     private(set) var state: State = .canSleep
     private(set) var holders: [Holder] = []
 
+    // Why the keep-awake hook is holding the Mac awake.
+    //   .turn   — Claude is actively working a turn
+    //   .remote — held between turns because the session is remote-controlled
+    enum HookReason { case turn, remote, unknown }
+
     // Whether the Claude Code keep-awake hook's caffeinate is holding the Mac
-    // awake right now, and whether the hook script is installed at all.
+    // awake right now, why, and whether the hook script is installed at all.
     private(set) var hookActive = false
+    private(set) var hookReason: HookReason = .unknown
     private(set) var hookInstalled = false
+
+    // Whether any running Claude session currently has Remote Control
+    // connected — checked live (see checkRemoteControl), so it reflects a
+    // connect/disconnect within one poll, with no hook event needed.
+    private(set) var remoteControlActive = false
 
     // Assertions that keep the *machine* awake. Display-sleep assertions are
     // deliberately ignored — a dark screen with the Mac still working is
@@ -42,8 +54,10 @@ final class AwakeMonitor {
     // meaningfully, keeps the Mac awake.)
     private let ignoredProcesses: Set<String> = ["powerd", "bluetoothd", "sharingd"]
 
-    // keep-awake.sh writes its caffeinate PID here while a Claude turn runs.
+    // keep-awake.sh writes its caffeinate PID here while a Claude turn runs,
+    // and the reason ("turn" / "remote") in the sibling .reason file.
     private let hookPidFile = "/tmp/claude-keep-awake.pid"
+    private let hookReasonFile = "/tmp/claude-keep-awake.reason"
 
     // The hook script itself — its presence distinguishes "idle" from "not set up".
     static let hookScriptPath =
@@ -87,7 +101,9 @@ final class AwakeMonitor {
         }
         state = holders.isEmpty ? .canSleep : .awake
         hookActive = holders.contains { $0.isClaudeHook }
+        hookReason = hookActive ? readHookReason() : .unknown
         hookInstalled = FileManager.default.fileExists(atPath: Self.hookScriptPath)
+        remoteControlActive = checkRemoteControl()
     }
 
     private func runPmset() -> String {
@@ -110,6 +126,40 @@ final class AwakeMonitor {
         guard let raw = try? String(contentsOfFile: hookPidFile, encoding: .utf8)
         else { return nil }
         return Int(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    // Why the hook is holding the Mac awake, per its sibling .reason file.
+    private func readHookReason() -> HookReason {
+        guard let raw = try? String(contentsOfFile: hookReasonFile, encoding: .utf8)
+        else { return .unknown }
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines) {
+        case "turn":   return .turn
+        case "remote": return .remote
+        default:       return .unknown
+        }
+    }
+
+    // Live remote-control check: scan ~/.claude/sessions/<pid>.json for a
+    // running session whose bridgeSessionId is a non-empty string. Independent
+    // of the keep-awake hook, so it tracks connect/disconnect in real time.
+    private func checkRemoteControl() -> Bool {
+        let dir = (NSHomeDirectory() as NSString)
+            .appendingPathComponent(".claude/sessions")
+        guard let files = try? FileManager.default
+            .contentsOfDirectory(atPath: dir) else { return false }
+        for file in files where file.hasSuffix(".json") {
+            // Files are named by PID — skip sessions that have ended.
+            guard let pid = Int32(file.dropLast(5)), kill(pid, 0) == 0 else { continue }
+            let path = (dir as NSString).appendingPathComponent(file)
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let obj = try? JSONSerialization.jsonObject(with: data, options: [])
+                            as? [String: Any],
+                  let bridge = obj["bridgeSessionId"] as? String,
+                  !bridge.isEmpty
+            else { continue }
+            return true
+        }
+        return false
     }
 
     // Parses a `pmset` per-process line: "   pid 123(name): [...] ...".
@@ -144,6 +194,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let menu = NSMenu()
         menu.delegate = self
+        // Don't auto-disable action-less items — the info rows stay "enabled"
+        // so AppKit renders them at full/secondary label color instead of the
+        // dimmed "disabled command" gray.
+        menu.autoenablesItems = false
         statusItem.menu = menu
 
         update()
@@ -197,38 +251,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let menu = statusItem.menu else { return }
         menu.removeAllItems()
 
-        let header = NSMenuItem(
-            title: awake ? "Mac is being kept awake"
-                         : "Mac can sleep normally",
-            action: nil, keyEquivalent: "")
+        // Headline — primary status: full-contrast label color, flat icon.
+        let header = infoItem(awake ? "Mac is being kept awake"
+                                    : "Mac can sleep normally",
+                              color: .labelColor)
         if let icon = NSImage(
             systemSymbolName: awake ? "cup.and.saucer.fill" : "cup.and.saucer",
             accessibilityDescription: nil) {
-            icon.isTemplate = true   // flat, monochrome — follows the menu text color
+            icon.isTemplate = true
             header.image = icon
         }
-        header.isEnabled = false
         menu.addItem(header)
 
-        // Claude Code hook status — always shown, so you can tell at a glance
-        // whether Claude is what's keeping the Mac awake.
+        // Claude Code hook + live remote-control status — secondary info.
         menu.addItem(.separator())
-        let hookItem = NSMenuItem(title: claudeHookStatusText(),
-                                  action: nil, keyEquivalent: "")
-        hookItem.isEnabled = false
-        menu.addItem(hookItem)
+        menu.addItem(infoItem(claudeHookStatusText(), color: .secondaryLabelColor))
+        menu.addItem(infoItem(
+            monitor.remoteControlActive ? "Remote control: active"
+                                        : "Remote control: off",
+            color: .secondaryLabelColor))
 
         if awake && !monitor.holders.isEmpty {
             menu.addItem(.separator())
-            let label = NSMenuItem(title: "Kept awake by:", action: nil, keyEquivalent: "")
-            label.isEnabled = false
-            menu.addItem(label)
+            menu.addItem(infoItem("Kept awake by:", color: .secondaryLabelColor))
             for holder in monitor.holders {
                 let suffix = holder.isClaudeHook ? " (Claude Code hook)" : ""
-                let item = NSMenuItem(title: "    •  \(holder.name)\(suffix)",
-                                      action: nil, keyEquivalent: "")
-                item.isEnabled = false
-                menu.addItem(item)
+                menu.addItem(infoItem("\(holder.name)\(suffix)",
+                                      color: .secondaryLabelColor, indent: 1))
             }
         }
 
@@ -246,6 +295,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(quit)
     }
 
+    // A non-interactive informational row, drawn at an explicit color via
+    // attributedTitle — rather than the dimmed "disabled command" gray a
+    // plain disabled item would get.
+    private func infoItem(_ text: String, color: NSColor, indent: Int = 0) -> NSMenuItem {
+        // Left enabled (the menu has autoenablesItems = false) so AppKit does
+        // not dim it; with no action it is still effectively non-interactive.
+        let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+        item.indentationLevel = indent
+        item.attributedTitle = NSAttributedString(
+            string: text,
+            attributes: [.foregroundColor: color,
+                         .font: NSFont.menuFont(ofSize: 0)])
+        return item
+    }
+
     // The always-present Claude line. Between turns the hook's caffeinate is
     // gone, so this reports the last time it ran rather than just "idle".
     private func claudeHookStatusText() -> String {
@@ -253,7 +317,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return "Claude Code hook: not installed"
         }
         if monitor.hookActive {
-            return "Claude Code hook: keeping the Mac awake now"
+            switch monitor.hookReason {
+            case .turn:
+                return "Claude Code hook: Claude is working"
+            case .remote:
+                // The reason file can be stale if remote control dropped
+                // between turns — verify against the live check.
+                return monitor.remoteControlActive
+                    ? "Claude Code hook: holding for a remote session"
+                    : "Claude Code hook: keeping the Mac awake now"
+            case .unknown:
+                return "Claude Code hook: keeping the Mac awake now"
+            }
         }
         if let last = hookLastActive {
             return "Claude Code hook: idle (last active \(Self.relativeAge(last)))"
