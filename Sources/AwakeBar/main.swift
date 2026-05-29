@@ -328,6 +328,42 @@ enum AwakeMonitor {
     }
 }
 
+// MARK: - Power assertion
+
+// A single IOKit power assertion that AwakeBar holds itself. `set(true)`
+// creates it (idempotent), `set(false)` releases it; `held` reflects the
+// current state. PreventUserIdleSystemSleep mirrors `caffeinate -i`: the Mac
+// stays awake but the display may still sleep.
+@MainActor
+final class PowerAssertion {
+    private let name: String
+    private var id: IOPMAssertionID = 0
+    private(set) var held = false
+
+    init(_ name: String) { self.name = name }
+
+    func set(_ active: Bool) {
+        if active, !held {
+            var newID = IOPMAssertionID(0)
+            let result = IOPMAssertionCreateWithName(
+                kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+                IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                name as CFString,
+                &newID)
+            if result == kIOReturnSuccess {
+                id = newID
+                held = true
+            } else {
+                NSLog("AwakeBar: power assertion '%@' failed (0x%08x)", name, result)
+            }
+        } else if !active, held {
+            IOPMAssertionRelease(id)
+            id = 0
+            held = false
+        }
+    }
+}
+
 // MARK: - App
 
 @MainActor
@@ -347,13 +383,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // important because a refresh may land while the menu is open.
     private var lastMenuSignature: String?
 
-    // While a Remote Control bridge is connected, AwakeBar holds its own power
-    // assertion so the Mac stays awake even in the gap between turns when the
-    // keep-awake hook isn't holding one (the hook only re-evaluates on hook
-    // events, so it can't react to a mid-idle bridge connect). 0 / false when
-    // not held.
-    private var remoteAssertionID: IOPMAssertionID = 0
-    private var holdingRemoteAssertion = false
+    // Power assertions AwakeBar holds itself. The remote one tracks Remote
+    // Control automatically — so the Mac stays awake even in the gap between
+    // turns the event-driven keep-awake hook can't cover. The manual one is the
+    // user's "Keep awake" menu toggle, not persisted (resets to off on launch).
+    private let remoteAssertion = PowerAssertion("AwakeBar: Remote Control session connected")
+    private let manualAssertion = PowerAssertion("AwakeBar: Keep awake (manual)")
+    private var manualKeepAwake = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Create the status item HERE, not in a property initializer — doing it
@@ -407,17 +443,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func apply(_ snapshot: AwakeMonitor.Snapshot) {
         snap = snapshot
         if snapshot.hookActive { hookLastActive = Date() }
+        // Track Remote Control automatically; the manual hold is driven by the
+        // menu toggle. Then reflect everything in the icon and menu.
+        remoteAssertion.set(snapshot.remoteControlActive)
+        render()
+    }
 
-        // Hold (or release) our own assertion to match remote-control state,
-        // then reflect *actual* awake state: a real external assertion OR the
-        // one we are holding ourselves.
-        updateRemoteAssertion(active: snapshot.remoteControlActive)
-        let awake = snapshot.state == .awake || holdingRemoteAssertion
+    // Reflect current state — the snapshot plus the assertions we hold — in the
+    // icon and menu. Called after every refresh and whenever a toggle changes.
+    private func render() {
+        // Awake means a real external assertion OR one we are holding ourselves.
+        let awake = snap.state == .awake || remoteAssertion.held || manualAssertion.held
 
         updateButton(awake: awake)
 
         if awake != lastAwake {
-            let names = snapshot.holders
+            let names = snap.holders
                 .map { $0.isClaudeHook ? "\($0.name)(claude-hook)" : $0.name }
                 .joined(separator: ", ")
             NSLog("AwakeBar: state = %@, holders = [%@]",
@@ -434,10 +475,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateButton(awake: Bool) {
         guard let button = statusItem.button else { return }
-        let symbol = awake ? "cup.and.saucer.fill" : "cup.and.saucer"
-        if let image = NSImage(systemSymbolName: symbol,
-                               accessibilityDescription: "Keep-awake status") {
-            image.isTemplate = true
+        let forced = manualAssertion.held
+        if let image = statusImage(awake: awake, forced: forced) {
             button.image = image
             button.title = ""
         } else {
@@ -445,34 +484,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             button.image = nil
             button.title = awake ? "☕︎" : "Zz"
         }
-        button.toolTip = awake ? "Mac is being kept awake"
-                               : "Mac can sleep normally"
+        button.toolTip = forced ? "Keep awake is on — Mac forced awake"
+                       : awake  ? "Mac is being kept awake"
+                                : "Mac can sleep normally"
     }
 
-    // Create our power assertion when a remote session connects, release it
-    // when none is connected. Idempotent: only acts on a real transition.
-    // PreventUserIdleSystemSleep mirrors the hook's `caffeinate -i` — it stops
-    // the *idle* sleep that would otherwise drop a connected-but-idle session;
-    // the display may still sleep.
-    private func updateRemoteAssertion(active: Bool) {
-        if active, !holdingRemoteAssertion {
-            var id = IOPMAssertionID(0)
-            let result = IOPMAssertionCreateWithName(
-                kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
-                IOPMAssertionLevel(kIOPMAssertionLevelOn),
-                "AwakeBar: Remote Control session connected" as CFString,
-                &id)
-            if result == kIOReturnSuccess {
-                remoteAssertionID = id
-                holdingRemoteAssertion = true
-            } else {
-                NSLog("AwakeBar: IOPMAssertionCreateWithName failed (0x%08x)", result)
-            }
-        } else if !active, holdingRemoteAssertion {
-            IOPMAssertionRelease(remoteAssertionID)
-            remoteAssertionID = 0
-            holdingRemoteAssertion = false
+    // The menu-bar cup. Normally a template image, so it adapts to the menu bar
+    // (black/white, inverts when the menu is open). When the manual "Keep
+    // awake" hold is on, a red dot is composited at the bottom-right; that
+    // forces a *non-template* image (template images are drawn monochrome by
+    // the system, which would erase the red), so the cup itself is redrawn in
+    // the menu bar's label colour to still look right.
+    private func statusImage(awake: Bool, forced: Bool) -> NSImage? {
+        let symbol = awake ? "cup.and.saucer.fill" : "cup.and.saucer"
+        guard let base = NSImage(systemSymbolName: symbol,
+                                 accessibilityDescription: "Keep-awake status")
+        else { return nil }
+        guard forced else {
+            base.isTemplate = true
+            return base
         }
+        let size = base.size
+        let badged = NSImage(size: size)
+        let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
+        appearance.performAsCurrentDrawingAppearance {
+            badged.lockFocus()
+            // Cup: recolour the template glyph to the menu bar's label colour.
+            let rect = NSRect(origin: .zero, size: size)
+            base.draw(in: rect)
+            NSColor.labelColor.set()
+            rect.fill(using: .sourceAtop)
+            // Red badge, tangent to the bottom-right corner.
+            let d = (size.height * 0.46).rounded()
+            NSColor.systemRed.setFill()
+            NSBezierPath(ovalIn: NSRect(x: size.width - d, y: 0, width: d, height: d)).fill()
+            badged.unlockFocus()
+        }
+        badged.isTemplate = false
+        return badged
     }
 
     // A fingerprint of everything rebuildMenu renders (minus volatile relative
@@ -488,7 +537,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             String(snap.hookActive),
             String(describing: snap.hookReason),
             String(snap.remoteControlActive),
-            String(holdingRemoteAssertion),
+            String(remoteAssertion.held),
+            String(manualAssertion.held),
             snap.remoteProjects.joined(separator: ","),
             holders,
         ].joined(separator: "~")
@@ -525,8 +575,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var keptAwakeBy = snap.holders.map {
             $0.isClaudeHook ? "\($0.name) (Claude Code hook)" : $0.name
         }
-        if holdingRemoteAssertion {
+        if remoteAssertion.held {
             keptAwakeBy.append("AwakeBar (Remote Control session)")
+        }
+        if manualAssertion.held {
+            keptAwakeBy.append("AwakeBar (manual)")
         }
         if awake && !keptAwakeBy.isEmpty {
             menu.addItem(.separator())
@@ -537,6 +590,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+
+        // Manual override: hold the Mac awake regardless of Claude/remote state.
+        let keepAwake = NSMenuItem(title: "Keep awake",
+                                   action: #selector(toggleKeepAwake), keyEquivalent: "")
+        keepAwake.target = self
+        keepAwake.state = manualKeepAwake ? .on : .off
+        keepAwake.toolTip = "Hold the Mac awake until turned off (the display may still sleep)"
+        menu.addItem(keepAwake)
 
         let login = NSMenuItem(title: "Open at Login",
                                action: #selector(toggleLogin), keyEquivalent: "")
@@ -613,8 +674,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // Toggle the manual "Keep awake" hold and re-render immediately.
+    @objc private func toggleKeepAwake() {
+        manualKeepAwake.toggle()
+        manualAssertion.set(manualKeepAwake)
+        render()
+    }
+
     @objc private func quit() {
-        updateRemoteAssertion(active: false)   // don't leak the assertion
+        remoteAssertion.set(false)   // don't leak assertions
+        manualAssertion.set(false)
         NSApp.terminate(nil)
     }
 }

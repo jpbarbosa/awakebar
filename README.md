@@ -41,13 +41,19 @@ Claude Desktop's own keep-awake). Ambient daemons (`powerd`, `bluetoothd`,
 `sharingd`) are filtered out so a filled cup means something deliberate.
 
 AwakeBar is mostly an *observer* — it reads the system's assertions rather than
-creating them. The one exception is Remote Control: while a bridge is connected
-it holds its own `PreventUserIdleSystemSleep` assertion (named *"AwakeBar:
-Remote Control session connected"*), so a session driven from claude.ai / mobile
-can't be dropped by idle sleep in the gap between turns when the keep-awake hook
-isn't holding one. That assertion is filtered out of AwakeBar's own holder list
-(so it never circularly lists itself) and surfaced instead as **Kept awake by:
-AwakeBar (Remote Control session)**.
+creating them. It holds its own `PreventUserIdleSystemSleep` assertion (the Mac
+stays awake; the display may still sleep) in two cases:
+
+- **Remote Control** — automatically, while a bridge is connected, so a session
+  driven from claude.ai / mobile can't be dropped by idle sleep in the gap
+  between turns when the keep-awake hook isn't holding one.
+- **Keep awake** — a manual menu toggle to force the Mac awake regardless of
+  Claude. It resets to off on each launch, and the menu-bar cup gets a small
+  **red badge** while it's on.
+
+Either assertion is filtered out of AwakeBar's own holder list (so it never
+circularly lists itself) and surfaced instead under **Kept awake by:** as
+*AwakeBar (Remote Control session)* / *AwakeBar (manual)*.
 
 ## Build & install
 
