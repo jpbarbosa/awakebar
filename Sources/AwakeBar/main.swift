@@ -783,28 +783,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         let header = infoItem(awake ? "Mac is being kept awake"
                                     : "Mac can sleep normally",
                               color: .labelColor)
-        if let icon = NSImage(
+        // The cup shares the same fixed leading slot as every other row, so the
+        // headline lines up with the status dots and the controls below.
+        let cup = NSImage(
             systemSymbolName: awake ? "cup.and.saucer.fill" : "cup.and.saucer",
-            accessibilityDescription: nil) {
-            icon.isTemplate = true
-            header.image = icon
-        }
+            accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+        header.image = leadingSlot(cup, template: true)
         menu.addItem(header)
 
         // Claude Code hook + live remote-control status — secondary info.
         menu.addItem(.separator())
-        menu.addItem(infoItem(claudeHookStatusText(), color: .secondaryLabelColor))
+        menu.addItem(infoItem(claudeHookStatusText(), color: .secondaryLabelColor,
+                              status: snap.hookActive))
         if snap.remoteControlActive {
-            menu.addItem(infoItem("Remote control: active", color: .secondaryLabelColor))
+            menu.addItem(infoItem("Remote Control: Active", color: .secondaryLabelColor,
+                                  status: true))
             for project in snap.remoteProjects {
                 menu.addItem(infoItem(project, color: .secondaryLabelColor, indent: 1))
             }
         } else {
-            menu.addItem(infoItem("Remote control: off", color: .secondaryLabelColor))
+            menu.addItem(infoItem("Remote Control: Off", color: .secondaryLabelColor,
+                                  status: false))
         }
 
         var keptAwakeBy = snap.holders.map {
-            $0.isClaudeHook ? "\($0.name) (Claude Code hook)" : $0.name
+            $0.isClaudeHook ? "\($0.name) (Claude Code Hook)" : $0.name
         }
         if remoteAssertion.held {
             keptAwakeBy.append("AwakeBar (Remote Control session)")
@@ -813,40 +817,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             keptAwakeBy.append("AwakeBar (manual)")
         }
         if awake && !keptAwakeBy.isEmpty {
-            menu.addItem(.separator())
-            menu.addItem(infoItem("Kept awake by:", color: .secondaryLabelColor))
+            // A native section header carries its own grouping rule, so no
+            // separator is needed above it.
+            menu.addItem(.sectionHeader(title: "Kept awake by"))
             for label in keptAwakeBy {
-                menu.addItem(infoItem(label, color: .secondaryLabelColor, indent: 1))
+                let row = infoItem(label, color: .secondaryLabelColor)
+                row.image = spacerSlot()   // align with the other rows' text column
+                menu.addItem(row)
             }
         }
 
         menu.addItem(.separator())
 
         // Manual override: hold the Mac awake regardless of Claude/remote state.
-        let keepAwake = NSMenuItem(title: "Keep awake",
+        let keepAwake = NSMenuItem(title: "Force Stay Awake",
                                    action: #selector(toggleKeepAwake), keyEquivalent: "")
         keepAwake.target = self
-        keepAwake.state = manualKeepAwake ? .on : .off
-        keepAwake.toolTip = "Hold the Mac awake until turned off (the display may still sleep)"
+        keepAwake.toolTip = "Force the Mac awake until turned off, regardless of Claude or Remote Control (the display may still sleep)"
+        keepAwake.image = checkmarkSlot(manualKeepAwake)
         menu.addItem(keepAwake)
 
         // Withdraw a delivered "Claude is waiting" alert once that session resumes
         // after you act. On by default; turn off to keep alerts in Notification
         // Center as a record.
-        let autoClear = NSMenuItem(title: "Clear alerts when resumed",
+        let autoClear = NSMenuItem(title: "Clear Notifications When Resumed",
                                    action: #selector(toggleAutoClear), keyEquivalent: "")
         autoClear.target = self
-        autoClear.state = autoClearAlerts ? .on : .off
         autoClear.toolTip = "Withdraw a \u{201C}Claude is waiting\u{201D} notification once that session starts running again"
+        autoClear.image = checkmarkSlot(autoClearAlerts)
         menu.addItem(autoClear)
 
         // How long a blocked session waits before alerting — answer within the
         // delay and no notification fires. A checkmark marks the active choice.
-        let delay = NSMenuItem(title: "Alert delay", action: nil, keyEquivalent: "")
+        let delay = NSMenuItem(title: "Notification Delay", action: nil, keyEquivalent: "")
         let delaySub = NSMenu()
         delaySub.autoenablesItems = false
         for seconds in Self.graceChoices {
-            let choice = NSMenuItem(title: "\(Int(seconds)) seconds",
+            let choice = NSMenuItem(title: "\(Int(seconds)) Seconds",
                                     action: #selector(setGrace(_:)), keyEquivalent: "")
             choice.target = self
             choice.tag = Int(seconds)
@@ -854,12 +861,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             delaySub.addItem(choice)
         }
         delay.submenu = delaySub
+        delay.image = spacerSlot()
         menu.addItem(delay)
 
         let login = NSMenuItem(title: "Open at Login",
                                action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
-        login.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
+        login.image = checkmarkSlot(SMAppService.mainApp.status == .enabled)
         menu.addItem(login)
 
         // Set Quit apart from the settings above, per macOS menu convention.
@@ -868,13 +876,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         let quit = NSMenuItem(title: "Quit AwakeBar",
                               action: #selector(quit), keyEquivalent: "q")
         quit.target = self
+        quit.image = spacerSlot()
         menu.addItem(quit)
     }
 
     // A non-interactive informational row, drawn at an explicit color via
     // attributedTitle — rather than the dimmed "disabled command" gray a
     // plain disabled item would get.
-    private func infoItem(_ text: String, color: NSColor, indent: Int = 0) -> NSMenuItem {
+    private func infoItem(_ text: String, color: NSColor, indent: Int = 0,
+                          status: Bool? = nil) -> NSMenuItem {
         // Left enabled (the menu has autoenablesItems = false) so AppKit does
         // not dim it; with no action it is still effectively non-interactive.
         let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
@@ -883,33 +893,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             string: text,
             attributes: [.foregroundColor: color,
                          .font: NSFont.menuFont(ofSize: 0)])
+        if let status, indent == 0 {
+            item.image = leadingSlot(statusDot(active: status), template: false)
+        }
         return item
+    }
+
+    // A small leading status dot for info rows: filled green when the subsystem
+    // is active, a dim hollow ring when not — shape plus color, so it still reads
+    // in grayscale (the row's text stays the primary signal). isTemplate is
+    // cleared so the menu honours the palette tint instead of recolouring it.
+    private func statusDot(active: Bool) -> NSImage? {
+        let config = NSImage.SymbolConfiguration(pointSize: 10, weight: .regular)
+            .applying(NSImage.SymbolConfiguration(
+                paletteColors: [active ? .systemGreen : .tertiaryLabelColor]))
+        let dot = NSImage(systemSymbolName: active ? "circle.fill" : "circle",
+                          accessibilityDescription: active ? "active" : "inactive")?
+            .withSymbolConfiguration(config)
+        dot?.isTemplate = false
+        return dot
+    }
+
+    // Every top-level content row gets a leading image of this exact size — a
+    // status dot, the header cup, or a transparent spacer — so their titles share
+    // one image column and line up, the way Apple's own menus that mix checkmarks
+    // and icons do. (Without this, imaged rows indent right of plain rows.)
+    private static let leadingSlotSize = NSSize(width: 16, height: 16)
+
+    // Draw `symbol` centred (aspect-fit, never upscaled) into a fixed-size slot.
+    // nil yields a transparent spacer. template:true keeps the menu's automatic
+    // label-colour tinting (used for the cup); false preserves a colour the dot
+    // already carries.
+    private func leadingSlot(_ symbol: NSImage?, template: Bool) -> NSImage {
+        let size = Self.leadingSlotSize
+        let slot = NSImage(size: size)
+        slot.lockFocus()
+        if let symbol, symbol.size.width > 0, symbol.size.height > 0 {
+            let s = symbol.size
+            let scale = min(size.width / s.width, size.height / s.height, 1)
+            let w = s.width * scale, h = s.height * scale
+            symbol.draw(in: NSRect(x: (size.width - w) / 2, y: (size.height - h) / 2,
+                                   width: w, height: h))
+        }
+        slot.unlockFocus()
+        slot.isTemplate = template
+        return slot
+    }
+
+    private func spacerSlot() -> NSImage { leadingSlot(nil, template: false) }
+
+    // A checkmark drawn into the same leading slot as the dots, so a ticked row
+    // lines up with the status rows instead of sitting in AppKit's separate state
+    // column. Off rows get a blank spacer of equal width. We forgo NSMenuItem's
+    // native .state in the main menu for this — the pay-off is one aligned column.
+    private func checkmarkSlot(_ on: Bool) -> NSImage {
+        guard on else { return spacerSlot() }
+        let check = NSImage(systemSymbolName: "checkmark", accessibilityDescription: "on")?
+            .withSymbolConfiguration(.init(pointSize: 12, weight: .semibold))
+        return leadingSlot(check, template: true)
     }
 
     // The always-present Claude line. Between turns the hook's caffeinate is
     // gone, so this reports the last time it ran rather than just "idle".
     private func claudeHookStatusText() -> String {
         if !snap.hookInstalled {
-            return "Claude Code hook: not installed"
+            return "Claude Code Hook: not installed"
         }
         if snap.hookActive {
             switch snap.hookReason {
             case .turn:
-                return "Claude Code hook: Claude is working"
+                return "Claude Code Hook: Claude is working"
             case .remote:
                 // The reason file can be stale if remote control dropped
                 // between turns — verify against the live check.
                 return snap.remoteControlActive
-                    ? "Claude Code hook: holding for a remote session"
-                    : "Claude Code hook: keeping the Mac awake now"
+                    ? "Claude Code Hook: holding for a remote session"
+                    : "Claude Code Hook: keeping the Mac awake now"
             case .unknown:
-                return "Claude Code hook: keeping the Mac awake now"
+                return "Claude Code Hook: keeping the Mac awake now"
             }
         }
         if let last = hookLastActive {
-            return "Claude Code hook: idle (last active \(Self.relativeAge(last)))"
+            return "Claude Code Hook: idle (last active \(Self.relativeAge(last)))"
         }
-        return "Claude Code hook: idle"
+        return "Claude Code Hook: idle"
     }
 
     private static func relativeAge(_ date: Date) -> String {
