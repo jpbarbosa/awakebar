@@ -1,7 +1,8 @@
 import Cocoa
 import ServiceManagement
 import IOKit.pwr_mgt   // IOPMAssertion*, to hold the Mac awake for remote sessions
-import Darwin          // kill(2), for the session liveness check
+import UserNotifications // UNUserNotificationCenter, for "Claude is waiting" alerts
+import Darwin          // kill(2), open/close + O_EVTONLY for the marker watcher
 
 // MARK: - Monitor
 //
@@ -364,10 +365,71 @@ final class PowerAssertion {
     }
 }
 
+// MARK: - Attention watcher
+//
+// Watches the marker file notify-attention.sh writes when Claude Code is
+// blocked waiting on the user. A kqueue-backed DispatchSource fires the moment
+// the file changes, so the alert is effectively instant rather than waiting on
+// the 10s poll. The hook rewrites the file in place (`> file`), keeping the
+// inode, so a plain `.write`/`.extend` is the common path; `.delete`/`.rename`
+// (an atomic replace, or the file going away) re-arm the watch on a fresh fd.
+//
+// @unchecked Sendable: every member is touched only from `queue`, a single
+// serial queue, so the mutable `source` is never raced — but that confinement
+// is a runtime invariant the compiler can't see, hence unchecked.
+final class AttentionWatcher: @unchecked Sendable {
+    private let path: String
+    private let onChange: @Sendable () -> Void
+    private let queue = DispatchQueue(label: "io.jp7.awakebar.attention")
+    private var source: DispatchSourceFileSystemObject?
+
+    init(path: String, onChange: @escaping @Sendable () -> Void) {
+        self.path = path
+        self.onChange = onChange
+    }
+
+    func start() { queue.async { [weak self] in self?.arm() } }
+
+    private func arm() {
+        let fd = open(path, O_EVTONLY)
+        guard fd >= 0 else {
+            // Not created yet (the hook hasn't fired). Retry; one cheap syscall.
+            queue.asyncAfter(deadline: .now() + 3) { [weak self] in self?.arm() }
+            return
+        }
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .extend, .delete, .rename],
+            queue: queue)
+        src.setEventHandler { [weak self] in
+            guard let self else { return }
+            if src.data.contains(.delete) || src.data.contains(.rename) {
+                self.rearm()
+            } else {
+                self.onChange()
+            }
+        }
+        src.setCancelHandler { close(fd) }
+        source = src
+        src.resume()
+        // The file exists now: check it once, both to catch a write that landed
+        // between open() and resume(), and to surface a marker that was written
+        // while no watch was armed (e.g. just after launch).
+        onChange()
+    }
+
+    private func rearm() {
+        source?.cancel()   // the cancel handler closes the old fd
+        source = nil
+        queue.asyncAfter(deadline: .now() + 1) { [weak self] in self?.arm() }
+    }
+}
+
 // MARK: - App
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
+                         UNUserNotificationCenterDelegate {
     private var statusItem: NSStatusItem!
     private var snap = AwakeMonitor.Snapshot()
     private var timer: Timer?
@@ -391,6 +453,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let manualAssertion = PowerAssertion("AwakeBar: Keep awake (manual)")
     private var manualKeepAwake = false
 
+    // Native "Claude is waiting for you" notifications. notify-attention.sh (the
+    // Claude Code Notification hook) writes attentionMarkerPath when Claude is
+    // blocked on the user; the watcher fires the moment it changes and we post a
+    // notification unless VSCode is already frontmost. lastAttentionTs dedupes —
+    // each marker carries a unix-second ts and only a strictly newer one alerts,
+    // so a marker left over from before launch stays silent.
+    private let attentionMarkerPath = "/tmp/claude-attention.json"
+    private var attentionWatcher: AttentionWatcher?
+    private var lastAttentionTs = 0
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Create the status item HERE, not in a property initializer — doing it
         // before the app finishes launching can leave the item not displayed.
@@ -413,13 +485,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // The timer fires on the main run loop, so it is safe to assume
         // main-actor isolation here rather than hop with a Task.
-        timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refresh() }
         }
+
+        // Alert when Claude Code is blocked waiting on the user. Prime the dedup
+        // cursor from any marker left by a previous run BEFORE arming the watch,
+        // so launching AwakeBar never replays a stale "Claude is waiting" alert.
+        setUpNotifications()
+        primeAttention()
+        attentionWatcher = AttentionWatcher(path: attentionMarkerPath) { [weak self] in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.handleAttention() }
+            }
+        }
+        attentionWatcher?.start()
     }
 
     // Refresh the moment the menu opens. The refresh is async, so the menu
-    // appears instantly with the last poll's data (≤5s old) and updates in
+    // appears instantly with the last poll's data (≤10s old) and updates in
     // place a moment later if anything changed.
     func menuWillOpen(_ menu: NSMenu) { refresh() }
 
@@ -501,8 +585,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                  accessibilityDescription: "Keep-awake status")
         else { return nil }
         guard forced else {
-            base.isTemplate = true
-            return base
+            return nudgedDown(base, template: true)
         }
         let size = base.size
         let badged = NSImage(size: size)
@@ -511,7 +594,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             badged.lockFocus()
             // Cup: recolour the template glyph to the menu bar's label colour.
             let rect = NSRect(origin: .zero, size: size)
-            base.draw(in: rect)
+            base.draw(in: rect.offsetBy(dx: 0, dy: -iconVerticalNudge))
             NSColor.labelColor.set()
             rect.fill(using: .sourceAtop)
             // Red badge, tangent to the bottom-right corner.
@@ -522,6 +605,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         badged.isTemplate = false
         return badged
+    }
+
+    // The saucer gives cup.and.saucer a low optical centre, so the glyph reads
+    // as sitting high in the bar even though its box is centred. Shift the whole
+    // glyph down a couple of points within a same-size canvas (no rescaling, so
+    // the menu bar still centres the box) to correct the impression.
+    private let iconVerticalNudge: CGFloat = 0.5  // points down (~1px on Retina)
+
+    private func nudgedDown(_ image: NSImage, template: Bool) -> NSImage {
+        let size = image.size
+        let shifted = NSImage(size: size)
+        shifted.lockFocus()
+        // Bottom-left origin: "down" on screen is a negative y offset.
+        image.draw(in: NSRect(origin: .zero, size: size)
+                        .offsetBy(dx: 0, dy: -iconVerticalNudge))
+        shifted.unlockFocus()
+        shifted.isTemplate = template
+        return shifted
     }
 
     // A fingerprint of everything rebuildMenu renders (minus volatile relative
@@ -685,6 +786,103 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         remoteAssertion.set(false)   // don't leak assertions
         manualAssertion.set(false)
         NSApp.terminate(nil)
+    }
+
+    // MARK: Attention notifications
+
+    // The marker notify-attention.sh writes; `ts` is the dedup key (unix sec).
+    // All fields but ts are optional so a partial read (a write caught mid-flight)
+    // simply fails to decode and is retried on the next event, never crashes.
+    private struct AttentionEvent: Decodable {
+        var project: String?
+        var message: String?
+        var cwd: String?
+        var ts: Int
+    }
+
+    private func setUpNotifications() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { granted, error in
+            if let error {
+                NSLog("AwakeBar: notification auth error: %@", error.localizedDescription)
+            } else {
+                NSLog("AwakeBar: notification auth granted = %@", granted ? "yes" : "no")
+            }
+        }
+    }
+
+    private func readAttentionMarker() -> AttentionEvent? {
+        guard let data = FileManager.default.contents(atPath: attentionMarkerPath)
+        else { return nil }
+        return try? JSONDecoder().decode(AttentionEvent.self, from: data)
+    }
+
+    // Record the current marker's ts without alerting, so a marker written before
+    // this launch can't fire a notification at startup.
+    private func primeAttention() {
+        if let event = readAttentionMarker() { lastAttentionTs = event.ts }
+    }
+
+    // Called on the main actor whenever the marker changes. Alerts only for a
+    // strictly newer event, and only when you're not already looking at VSCode.
+    private func handleAttention() {
+        guard let event = readAttentionMarker(), event.ts > lastAttentionTs
+        else { return }
+        lastAttentionTs = event.ts
+        if vscodeIsFrontmost() { return }   // you can already see the prompt
+        postAttentionNotification(event)
+    }
+
+    private func postAttentionNotification(_ event: AttentionEvent) {
+        let content = UNMutableNotificationContent()
+        let project = (event.project?.isEmpty == false) ? event.project : nil
+        content.title = project.map { "Claude · \($0)" } ?? "Claude Code"
+        content.body = (event.message?.isEmpty == false)
+            ? event.message! : "Claude is waiting for you"
+        content.sound = .default
+        if let cwd = event.cwd { content.userInfo = ["cwd": cwd] }
+        // Unique per event so back-to-back waits don't collapse into one banner.
+        let request = UNNotificationRequest(identifier: "claude-attention-\(event.ts)",
+                                            content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    private func vscodeIsFrontmost() -> Bool {
+        guard let id = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        else { return false }
+        return id == "com.microsoft.VSCode" || id == "com.microsoft.VSCodeInsiders"
+    }
+
+    private func activateVSCode() {
+        for id in ["com.microsoft.VSCode", "com.microsoft.VSCodeInsiders"] {
+            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) {
+                NSWorkspace.shared.openApplication(
+                    at: url, configuration: NSWorkspace.OpenConfiguration())
+                return
+            }
+        }
+    }
+
+    // Show the banner even though AwakeBar is an accessory (LSUIElement) app, and
+    // bring VSCode forward when the banner is clicked. Both are nonisolated to
+    // satisfy UNUserNotificationCenterDelegate; UI work hops to the main actor.
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler:
+            @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void) {
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated { self.activateVSCode() }
+        }
+        completionHandler()
     }
 }
 
