@@ -109,40 +109,58 @@ what makes the **Claude Code hook** line light up.
 
 ## Notifications when Claude needs you
 
-AwakeBar can post a native macOS notification the moment Claude Code is
-**blocked waiting on you** — when it needs permission to run a tool, or when the
-prompt has been idle for ≥60s. This rides Claude Code's `Notification` hook
-event, which fires for exactly those two cases. Install the paired hook the same
-way as `keep-awake.sh` — copy `notify-attention.sh` to `~/.claude/` (`chmod +x`
-it) and wire it in `~/.claude/settings.json`:
+AwakeBar posts a native macOS notification when Claude Code is **blocked waiting
+on you** — when it needs permission to run a tool, or when the prompt has been
+idle for ≥60s. This rides Claude Code's `Notification` hook event, which fires
+for exactly those two cases. Install the paired hook by copying
+`notify-attention.sh` to `~/.claude/` (`chmod +x` it) and wiring these events in
+`~/.claude/settings.json` (the last three can sit alongside `keep-awake.sh` on
+the same events):
 
 ```json
 {
   "hooks": {
-    "Notification": [{ "hooks": [{ "type": "command", "command": "~/.claude/notify-attention.sh" }] }]
+    "Notification":     [{ "hooks": [{ "type": "command", "command": "~/.claude/notify-attention.sh" }] }],
+    "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "~/.claude/notify-attention.sh" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "~/.claude/notify-attention.sh" }] }],
+    "Stop":             [{ "hooks": [{ "type": "command", "command": "~/.claude/notify-attention.sh" }] }]
   }
 }
 ```
 
-The hook drops a marker at `/tmp/claude-attention.json` (`project`, `message`,
-`cwd`, and a `ts` dedup key); AwakeBar watches that file with a kqueue source —
-so the alert is effectively instant, not bound to the 10s poll — and posts the
-notification itself via `UNUserNotificationCenter`, titled with the project so
+On `Notification` the hook drops a marker at `/tmp/claude-attention.json`
+(`project`, `message`, `cwd`, and a `ts` dedup key); AwakeBar watches it with a
+kqueue source — so it reacts instantly, not bound to the 10s poll — and posts the
+notification via `UNUserNotificationCenter`, titled with the project so
 concurrent sessions are distinguishable. Clicking the banner brings VSCode
 forward.
 
-Two deliberate quiet rules keep it from nagging:
+The alert is **deferred ~10 seconds**, then dropped if you've engaged with that
+session in the meantime — so it only fires when you've actually stepped away:
 
-- **Suppressed when VSCode is already frontmost** — if you're looking right at
-  the prompt, no banner.
+- **Quiet if you're on it** — the other three events (`PostToolUse`,
+  `UserPromptSubmit`, `Stop`) bump a per-`cwd` activity marker. If that session's
+  activity moves past the attention timestamp within the grace window — you
+  approved the prompt, typed, or the turn ended — no banner. Keying by `cwd`
+  means a *different* busy session (or VSCode window) never silences this one,
+  which a plain "is VSCode frontmost?" check got wrong.
 - **No replay on launch** — a marker left over from before AwakeBar started is
-  recorded as already-seen, never re-alerted; only a strictly newer `ts` fires.
+  recorded as already-seen; only a strictly newer `ts` fires.
+
+**VSCode is the exception.** The `Notification` hook never fires for VSCode's
+*in-panel* permission prompts — it's a terminal-CLI event — so the hook path
+above covers terminal sessions only. For VSCode, AwakeBar instead reads the
+extension's debug log (the same log it uses for Remote Control), which records
+the extension's own `show_notification` intent (*"Claude is requesting permission
+to use …"*) and the resolution (`tool_permission_response`, or the session
+leaving `waiting_input`). The same ~10s grace applies — answer within the window
+and no banner fires. Like the Remote Control detection this parses undocumented
+log strings, centralised in `main.swift` so a Claude Code rename is a one-line fix.
 
 The first time it fires, macOS asks you to allow notifications for AwakeBar. To
-turn the feature off, either remove the `Notification` hook or switch AwakeBar
-off in **System Settings ▸ Notifications**. Like the Remote Control detection,
-the alert works for any session (terminal too); the frontmost-VSCode suppression
-just tailors it to the VSCode workflow.
+turn the feature off, remove the hooks or switch AwakeBar off in **System
+Settings ▸ Notifications**. It works for any session — terminal (via the hook) or
+VSCode (via the log), in any window.
 
 ### How Remote Control is detected
 

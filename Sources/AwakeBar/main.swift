@@ -32,6 +32,16 @@ enum AwakeMonitor {
     //   .remote — held between turns because the session is remote-controlled
     enum HookReason: Sendable { case turn, remote, unknown }
 
+    // One attention notification parsed from a VSCode extension log: the project
+    // it belongs to, the message the extension wanted to show, when it fired, and
+    // whether it was already resolved (you answered) by the time we scanned.
+    struct VSCodeAttention: Sendable {
+        let project: String
+        let message: String
+        let time: Date
+        let resolved: Bool
+    }
+
     // An immutable view of everything the menu needs, produced by collect().
     struct Snapshot: Sendable {
         var state: State = .canSleep
@@ -47,6 +57,11 @@ enum AwakeMonitor {
         // have Remote Control connected. Empty means no remote session.
         var remoteProjects: [String] = []
         var remoteControlActive: Bool { !remoteProjects.isEmpty }
+
+        // Attention notifications the VSCode extension surfaced (permission
+        // prompts). Its in-panel toasts don't reach the OS and the Notification
+        // hook never fires for them, so this log-derived list is the only signal.
+        var vscodeAttention: [VSCodeAttention] = []
     }
 
     // Assertions that keep the *machine* awake. Display-sleep assertions are
@@ -127,6 +142,7 @@ enum AwakeMonitor {
         snap.hookReason = snap.hookActive ? readHookReason() : .unknown
         snap.hookInstalled = FileManager.default.fileExists(atPath: hookScriptPath)
         snap.remoteProjects = checkRemoteControl()
+        snap.vscodeAttention = collectVSCodeAttention()
         return snap
     }
 
@@ -195,6 +211,77 @@ enum AwakeMonitor {
             }
         }
         return projects
+    }
+
+    // MARK: VSCode attention notifications
+
+    // The VSCode extension can't post an OS notification when its window is in the
+    // background — it logs its intent instead (a show_notification message) and
+    // logs the resolution (you answering) as a tool_permission_response or a
+    // state→running change. The Notification *hook* never fires for these in-panel
+    // prompts, so this log is the only signal there. We parse recent ones; the app
+    // defers each by the grace period and drops it if it was resolved in time.
+    private static let vscodeNotifyFreshness: TimeInterval = 5 * 60
+    private static let notifyMarker = "\"type\":\"show_notification\""
+    private static let notifyWanted = "requesting permission"   // skip UI hints
+    private static let resolveMarkers = ["\"type\":\"tool_permission_response\"",
+                                         "\"state\":\"running\""]
+
+    // Fixed calendar for the log's local "yyyy-MM-dd HH:mm:ss.SSS" timestamps.
+    private static let logCalendar: Calendar = {
+        var c = Calendar(identifier: .gregorian); c.timeZone = .current; return c
+    }()
+
+    private static func collectVSCodeAttention() -> [VSCodeAttention] {
+        guard hasLiveSession() else { return [] }
+        let cutoff = Date().addingTimeInterval(-vscodeNotifyFreshness)
+        var events: [VSCodeAttention] = []
+        for log in recentVSCodeLogs(within: remoteLogFreshness) {
+            guard let data = tailData(ofFile: log, maxBytes: 1 << 21) else { continue }
+            let text = String(decoding: data, as: UTF8.self)
+            let project = lastCwd(in: data).map { ($0 as NSString).lastPathComponent }
+                ?? "Claude session"
+            // One pass: collect resolution times and the notification lines.
+            var resolveTimes: [Date] = []
+            var notifs: [(time: Date, message: String)] = []
+            for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+                let isResolve = resolveMarkers.contains { line.contains($0) }
+                let isNotify = line.contains(notifyMarker) && line.contains(notifyWanted)
+                guard isResolve || isNotify, let t = lineTime(line) else { continue }
+                if isResolve { resolveTimes.append(t) }
+                if isNotify, let msg = notifyMessage(in: line) { notifs.append((t, msg)) }
+            }
+            for n in notifs where n.time >= cutoff {
+                events.append(VSCodeAttention(
+                    project: project, message: n.message, time: n.time,
+                    resolved: resolveTimes.contains { $0 > n.time }))
+            }
+        }
+        return events
+    }
+
+    // Parse the leading "yyyy-MM-dd HH:mm:ss.SSS" timestamp of a log line, nil if
+    // the line doesn't start with one (e.g. a wrapped continuation line).
+    private static func lineTime(_ line: Substring) -> Date? {
+        let c = Array(line.prefix(23))
+        guard c.count == 23 else { return nil }
+        func n(_ a: Int, _ b: Int) -> Int? { Int(String(c[a..<b])) }
+        guard let y = n(0, 4), let mo = n(5, 7), let d = n(8, 10),
+              let h = n(11, 13), let mi = n(14, 16), let s = n(17, 19), let ms = n(20, 23)
+        else { return nil }
+        var dc = DateComponents()
+        dc.year = y; dc.month = mo; dc.day = d
+        dc.hour = h; dc.minute = mi; dc.second = s; dc.nanosecond = ms * 1_000_000
+        return logCalendar.date(from: dc)
+    }
+
+    // Extract the "message":"…" value from a show_notification line (the messages
+    // hold no embedded quotes, so the first closing quote ends it).
+    private static func notifyMessage(in line: Substring) -> String? {
+        guard let r = line.range(of: "\"message\":\"") else { return nil }
+        let rest = line[r.upperBound...]
+        guard let end = rest.firstIndex(of: "\"") else { return nil }
+        return String(rest[..<end])
     }
 
     // True when some ~/.claude/sessions/<pid>.json is named by a live PID.
@@ -453,15 +540,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private let manualAssertion = PowerAssertion("AwakeBar: Keep awake (manual)")
     private var manualKeepAwake = false
 
-    // Native "Claude is waiting for you" notifications. notify-attention.sh (the
-    // Claude Code Notification hook) writes attentionMarkerPath when Claude is
-    // blocked on the user; the watcher fires the moment it changes and we post a
-    // notification unless VSCode is already frontmost. lastAttentionTs dedupes —
-    // each marker carries a unix-second ts and only a strictly newer one alerts,
-    // so a marker left over from before launch stays silent.
+    // Native "Claude is waiting for you" notifications. notify-attention.sh writes
+    // attentionMarkerPath when a session is blocked on the user; the watcher fires
+    // the moment it changes. Rather than alert at once, we wait attentionGrace and
+    // alert only if the user hasn't engaged with THAT session meanwhile — detected
+    // via a per-cwd activity marker the same hook bumps on prompt/tool/stop events
+    // (so one busy session can't silence another's alert). lastAttentionTs dedupes:
+    // only a strictly newer ts is considered, so a marker from before launch stays
+    // silent.
     private let attentionMarkerPath = "/tmp/claude-attention.json"
     private var attentionWatcher: AttentionWatcher?
     private var lastAttentionTs = 0
+    private var pendingAlert: DispatchWorkItem?
+    private let attentionGrace: TimeInterval = 10
+
+    // VSCode permission prompts surfaced via the extension log (see AwakeMonitor).
+    // appLaunch floors out events logged before launch; lastVSNotify is the
+    // per-project high-water of handled events so none is alerted twice.
+    private let appLaunch = Date()
+    private var lastVSNotify: [String: Date] = [:]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Create the status item HERE, not in a property initializer — doing it
@@ -530,6 +627,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // Track Remote Control automatically; the manual hold is driven by the
         // menu toggle. Then reflect everything in the icon and menu.
         remoteAssertion.set(snapshot.remoteControlActive)
+        processVSCodeAttention(snapshot.vscodeAttention)
         render()
     }
 
@@ -824,34 +922,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         if let event = readAttentionMarker() { lastAttentionTs = event.ts }
     }
 
-    // Called on the main actor whenever the marker changes. Alerts only for a
-    // strictly newer event, and only when you're not already looking at VSCode.
+    // Called on the main actor whenever the marker changes. Defers the alert by
+    // the grace period; fireIfStillWaiting then drops it if the user engaged with
+    // that session meanwhile. A newer event cancels and reschedules.
     private func handleAttention() {
         guard let event = readAttentionMarker(), event.ts > lastAttentionTs
         else { return }
         lastAttentionTs = event.ts
-        if vscodeIsFrontmost() { return }   // you can already see the prompt
-        postAttentionNotification(event)
+        pendingAlert?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.fireIfStillWaiting(event) }
+        pendingAlert = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + attentionGrace, execute: item)
     }
 
-    private func postAttentionNotification(_ event: AttentionEvent) {
+    // Fired attentionGrace after the event. If the session has since shown
+    // activity past the event (you approved a prompt, typed, or the turn ended),
+    // stay quiet — you're on it. Otherwise alert.
+    private func fireIfStillWaiting(_ event: AttentionEvent) {
+        pendingAlert = nil
+        if let cwd = event.cwd, activityTs(forCwd: cwd) > event.ts { return }
+        postAttentionNotification(project: event.project, message: event.message,
+                                  id: "claude-attention-\(event.ts)", cwd: event.cwd)
+    }
+
+    // VSCode path: alert on each attention event once it is at least attentionGrace
+    // old AND still unresolved — a prompt you answered within the grace stays quiet.
+    // Younger events wait for a later poll; lastVSNotify dedupes per project.
+    private func processVSCodeAttention(_ events: [AwakeMonitor.VSCodeAttention]) {
+        let ripe = Date().addingTimeInterval(-attentionGrace)
+        for ev in events.sorted(by: { $0.time < $1.time }) {
+            let last = lastVSNotify[ev.project] ?? appLaunch
+            guard ev.time > last, ev.time <= ripe else { continue }
+            lastVSNotify[ev.project] = ev.time
+            if ev.resolved { continue }
+            postAttentionNotification(
+                project: ev.project, message: ev.message,
+                id: "vscode-\(ev.project)-\(Int(ev.time.timeIntervalSince1970))", cwd: nil)
+        }
+    }
+
+    // Last activity time for a session, written per-cwd by notify-attention.sh.
+    // The sanitiser mirrors the hook's `tr -c 'A-Za-z0-9' '_'`.
+    private func activityTs(forCwd cwd: String) -> Int {
+        var safe = ""
+        for ch in cwd { safe.append(ch.isASCII && (ch.isLetter || ch.isNumber) ? ch : "_") }
+        let path = "/tmp/claude-activity-" + safe
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { return 0 }
+        return Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+    }
+
+    // Shared notification poster for both the terminal (hook/marker) and VSCode
+    // (extension-log) paths. `id` keeps back-to-back waits from collapsing.
+    private func postAttentionNotification(project: String?, message: String?,
+                                           id: String, cwd: String?) {
         let content = UNMutableNotificationContent()
-        let project = (event.project?.isEmpty == false) ? event.project : nil
-        content.title = project.map { "Claude · \($0)" } ?? "Claude Code"
-        content.body = (event.message?.isEmpty == false)
-            ? event.message! : "Claude is waiting for you"
+        let p = (project?.isEmpty == false) ? project : nil
+        content.title = p.map { "Claude · \($0)" } ?? "Claude Code"
+        content.body = (message?.isEmpty == false) ? message! : "Claude is waiting for you"
         content.sound = .default
-        if let cwd = event.cwd { content.userInfo = ["cwd": cwd] }
-        // Unique per event so back-to-back waits don't collapse into one banner.
-        let request = UNNotificationRequest(identifier: "claude-attention-\(event.ts)",
-                                            content: content, trigger: nil)
+        if let cwd { content.userInfo = ["cwd": cwd] }
+        let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
-    }
-
-    private func vscodeIsFrontmost() -> Bool {
-        guard let id = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-        else { return false }
-        return id == "com.microsoft.VSCode" || id == "com.microsoft.VSCodeInsiders"
     }
 
     private func activateVSCode() {
