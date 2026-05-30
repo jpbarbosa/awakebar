@@ -84,9 +84,13 @@ enum AwakeMonitor {
     private static let hookPidFile = "/tmp/claude-keep-awake.pid"
     private static let hookReasonFile = "/tmp/claude-keep-awake.reason"
 
+    // Absolute path for `rel` resolved under the user's home directory.
+    private static func home(_ rel: String) -> String {
+        (NSHomeDirectory() as NSString).appendingPathComponent(rel)
+    }
+
     // The hook script itself — its presence distinguishes "idle" from "not set up".
-    static let hookScriptPath =
-        (NSHomeDirectory() as NSString).appendingPathComponent(".claude/keep-awake.sh")
+    static let hookScriptPath = home(".claude/keep-awake.sh")
 
     // Read the whole world and return a Snapshot. Safe to call off the main
     // thread; touches no shared mutable state.
@@ -234,10 +238,9 @@ enum AwakeMonitor {
         let cutoff = Date().addingTimeInterval(-vscodeNotifyFreshness)
         var events: [VSCodeAttention] = []
         for log in recentVSCodeLogs(within: remoteLogFreshness) {
-            guard let data = tailData(ofFile: log, maxBytes: 1 << 21) else { continue }
+            guard let data = tailData(ofFile: log) else { continue }
             let text = String(decoding: data, as: UTF8.self)
-            let project = lastCwd(in: data).map { ($0 as NSString).lastPathComponent }
-                ?? "Claude session"
+            let project = projectLabel(in: data)
             // One pass: collect resolution times and the notification lines.
             var resolveTimes: [Date] = []
             var notifs: [(time: Date, message: String)] = []
@@ -285,8 +288,7 @@ enum AwakeMonitor {
 
     // True when some ~/.claude/sessions/<pid>.json is named by a live PID.
     private static func hasLiveSession() -> Bool {
-        let dir = (NSHomeDirectory() as NSString)
-            .appendingPathComponent(".claude/sessions")
+        let dir = home(".claude/sessions")
         guard let files = try? FileManager.default
             .contentsOfDirectory(atPath: dir) else { return false }
         for file in files where file.hasSuffix(".json") {
@@ -314,8 +316,7 @@ enum AwakeMonitor {
 
     // Claude Code VSCode extension-host logs modified within `seconds`.
     private static func recentVSCodeLogs(within seconds: TimeInterval) -> [String] {
-        let root = (NSHomeDirectory() as NSString)
-            .appendingPathComponent("Library/Application Support/Code/logs")
+        let root = home("Library/Application Support/Code/logs")
         let fm = FileManager.default
         guard let walker = fm.enumerator(atPath: root) else { return [] }
         let cutoff = Date().addingTimeInterval(-seconds)
@@ -343,7 +344,7 @@ enum AwakeMonitor {
     // most recent cwd in the tail, or a generic name if none survived.
     // (internal, not private, so AwakeBarTests can drive it with sample logs.)
     static func connectedProject(inTailOf path: String) -> String? {
-        guard let data = tailData(ofFile: path, maxBytes: 1 << 21) else { return nil }
+        guard let data = tailData(ofFile: path) else { return nil }
 
         func lastIndex(of marker: String) -> Int? {
             data.range(of: Data(marker.utf8), options: .backwards)?.lowerBound
@@ -360,8 +361,7 @@ enum AwakeMonitor {
             || data.range(of: Data("[bridge:".utf8)) != nil
         guard connected ?? sawBridgeActivity else { return nil }
 
-        return lastCwd(in: data).map { ($0 as NSString).lastPathComponent }
-            ?? "Claude session"
+        return projectLabel(in: data)
     }
 
     // The most recent cwd a VSCode-hosted session was launched with, read from
@@ -392,12 +392,24 @@ enum AwakeMonitor {
         return candidates.max(by: { $0.pos < $1.pos })?.path
     }
 
-    // Last `maxBytes` of a file as raw bytes (the whole file if it is smaller).
-    private static func tailData(ofFile path: String, maxBytes: Int) -> Data? {
+    // The project label for a log tail: the basename of the most recent cwd, or a
+    // generic name when none survived in the tail. Used by both the remote-control
+    // and attention-notification scans.
+    static func projectLabel(in data: Data) -> String {
+        lastCwd(in: data).map { ($0 as NSString).lastPathComponent } ?? "Claude session"
+    }
+
+    // How much of a (potentially multi-MB) log to read from the end. 2 MiB is far
+    // more than one session's handshake + recent traffic, and a backwards byte
+    // search over it stays fast.
+    private static let maxTailBytes = 1 << 21
+
+    // Last `maxTailBytes` of a file as raw bytes (the whole file if it is smaller).
+    private static func tailData(ofFile path: String) -> Data? {
         guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? fh.close() }
         guard let end = try? fh.seekToEnd() else { return nil }
-        let start = end > UInt64(maxBytes) ? end - UInt64(maxBytes) : 0
+        let start = end > UInt64(maxTailBytes) ? end - UInt64(maxTailBytes) : 0
         try? fh.seek(toOffset: start)
         return (try? fh.readToEnd()) ?? Data()
     }

@@ -119,6 +119,19 @@ import Foundation
     }
 }
 
+// MARK: - projectLabel
+
+@Suite struct ProjectLabelTests {
+    @Test func usesCwdBasename() {
+        let log = #"{"cwd":"/Users/jp/Sites/awakebar"}"#
+        #expect(AwakeMonitor.projectLabel(in: Data(log.utf8)) == "awakebar")
+    }
+
+    @Test func fallsBackWhenNoCwd() {
+        #expect(AwakeMonitor.projectLabel(in: Data("no cwd here".utf8)) == "Claude session")
+    }
+}
+
 // MARK: - connectedProject (drives the file-reading path with sample logs)
 
 @Suite struct ConnectedProjectTests {
