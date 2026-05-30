@@ -552,7 +552,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private var attentionWatcher: AttentionWatcher?
     private var lastAttentionTs = 0
     private var pendingAlert: DispatchWorkItem?
-    private let attentionGrace: TimeInterval = 10
+    // How long a session must stay blocked before we alert — the "Alert delay"
+    // submenu lets the user pick from graceChoices. Persisted across launches
+    // (loaded in applicationDidFinishLaunching, default 10s).
+    private static let graceKey = "attentionGraceSeconds"
+    private static let graceChoices: [TimeInterval] = [5, 10]
+    private var attentionGrace: TimeInterval = 10
 
     // VSCode permission prompts surfaced via the extension log (see AwakeMonitor).
     // appLaunch floors out events logged before launch; lastVSNotify is the
@@ -560,7 +565,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private let appLaunch = Date()
     private var lastVSNotify: [String: Date] = [:]
 
+    // Delivered "Claude is waiting" alerts we may withdraw once the session
+    // resumes after you act, so a stale banner doesn't linger in Notification
+    // Center. Terminal path: keyed by cwd → (id, event ts), cleared when that
+    // cwd's activity marker passes ts — the same "you're on it" signal
+    // fireIfStillWaiting uses to suppress the alert before it fires. VSCode path:
+    // keyed by project → (id, event time), cleared when that event shows resolved.
+    private var deliveredByCwd: [String: (id: String, ts: Int)] = [:]
+    private var deliveredVSCode: [String: (id: String, time: Date)] = [:]
+    // The "Clear alerts when resumed" menu toggle. On by default; when off we keep
+    // tracking delivered alerts but never withdraw them, so flipping it back on
+    // resumes clearing for the next session that resumes. Persisted across launches
+    // via UserDefaults (loaded in applicationDidFinishLaunching, default on).
+    private static let autoClearKey = "autoClearAlerts"
+    private var autoClearAlerts = true
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Restore the persisted "Clear alerts when resumed" choice. register makes
+        // bool(forKey:) return true when the user has never set it, so the default
+        // stays on.
+        UserDefaults.standard.register(defaults: [Self.autoClearKey: true,
+                                                  Self.graceKey: 10.0])
+        autoClearAlerts = UserDefaults.standard.bool(forKey: Self.autoClearKey)
+        let savedGrace = UserDefaults.standard.double(forKey: Self.graceKey)
+        attentionGrace = Self.graceChoices.contains(savedGrace) ? savedGrace : 10
+
         // Create the status item HERE, not in a property initializer — doing it
         // before the app finishes launching can leave the item not displayed.
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -628,6 +657,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // menu toggle. Then reflect everything in the icon and menu.
         remoteAssertion.set(snapshot.remoteControlActive)
         processVSCodeAttention(snapshot.vscodeAttention)
+        clearResumedAttentions()
         render()
     }
 
@@ -738,6 +768,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             String(snap.remoteControlActive),
             String(remoteAssertion.held),
             String(manualAssertion.held),
+            String(autoClearAlerts),
+            String(attentionGrace),
             snap.remoteProjects.joined(separator: ","),
             holders,
         ].joined(separator: "~")
@@ -798,11 +830,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         keepAwake.toolTip = "Hold the Mac awake until turned off (the display may still sleep)"
         menu.addItem(keepAwake)
 
+        // Withdraw a delivered "Claude is waiting" alert once that session resumes
+        // after you act. On by default; turn off to keep alerts in Notification
+        // Center as a record.
+        let autoClear = NSMenuItem(title: "Clear alerts when resumed",
+                                   action: #selector(toggleAutoClear), keyEquivalent: "")
+        autoClear.target = self
+        autoClear.state = autoClearAlerts ? .on : .off
+        autoClear.toolTip = "Withdraw a \u{201C}Claude is waiting\u{201D} notification once that session starts running again"
+        menu.addItem(autoClear)
+
+        // How long a blocked session waits before alerting — answer within the
+        // delay and no notification fires. A checkmark marks the active choice.
+        let delay = NSMenuItem(title: "Alert delay", action: nil, keyEquivalent: "")
+        let delaySub = NSMenu()
+        delaySub.autoenablesItems = false
+        for seconds in Self.graceChoices {
+            let choice = NSMenuItem(title: "\(Int(seconds)) seconds",
+                                    action: #selector(setGrace(_:)), keyEquivalent: "")
+            choice.target = self
+            choice.tag = Int(seconds)
+            choice.state = attentionGrace == seconds ? .on : .off
+            delaySub.addItem(choice)
+        }
+        delay.submenu = delaySub
+        menu.addItem(delay)
+
         let login = NSMenuItem(title: "Open at Login",
                                action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
         login.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
         menu.addItem(login)
+
+        // Set Quit apart from the settings above, per macOS menu convention.
+        menu.addItem(.separator())
 
         let quit = NSMenuItem(title: "Quit AwakeBar",
                               action: #selector(quit), keyEquivalent: "q")
@@ -880,6 +941,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         render()
     }
 
+    // Toggle whether resumed sessions auto-clear their delivered alerts. Turning
+    // it back on lets the next refresh withdraw anything that has since resumed.
+    @objc private func toggleAutoClear() {
+        autoClearAlerts.toggle()
+        UserDefaults.standard.set(autoClearAlerts, forKey: Self.autoClearKey)
+        if autoClearAlerts { clearResumedAttentions() }
+        render()
+    }
+
+    // Pick the alert delay from the submenu. The tag carries the seconds; takes
+    // effect on the next event (an already-scheduled alert keeps its old timing).
+    @objc private func setGrace(_ sender: NSMenuItem) {
+        let seconds = TimeInterval(sender.tag)
+        guard seconds != attentionGrace else { return }
+        attentionGrace = seconds
+        UserDefaults.standard.set(seconds, forKey: Self.graceKey)
+        render()
+    }
+
     @objc private func quit() {
         remoteAssertion.set(false)   // don't leak assertions
         manualAssertion.set(false)
@@ -941,23 +1021,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private func fireIfStillWaiting(_ event: AttentionEvent) {
         pendingAlert = nil
         if let cwd = event.cwd, activityTs(forCwd: cwd) > event.ts { return }
+        let id = "claude-attention-\(event.ts)"
         postAttentionNotification(project: event.project, message: event.message,
-                                  id: "claude-attention-\(event.ts)", cwd: event.cwd)
+                                  id: id, cwd: event.cwd)
+        if let cwd = event.cwd { deliveredByCwd[cwd] = (id, event.ts) }
+    }
+
+    // Withdraw an already-delivered terminal-path alert once that session resumes
+    // after you acted: the per-cwd activity marker passing the event ts is the
+    // same signal fireIfStillWaiting uses to stay quiet before the alert fires,
+    // applied here a step later — once polled (≤10s), not the instant it bumps.
+    private func clearResumedAttentions() {
+        guard autoClearAlerts, !deliveredByCwd.isEmpty else { return }
+        let center = UNUserNotificationCenter.current()
+        for (cwd, entry) in deliveredByCwd where activityTs(forCwd: cwd) > entry.ts {
+            center.removeDeliveredNotifications(withIdentifiers: [entry.id])
+            deliveredByCwd[cwd] = nil
+        }
     }
 
     // VSCode path: alert on each attention event once it is at least attentionGrace
     // old AND still unresolved — a prompt you answered within the grace stays quiet.
     // Younger events wait for a later poll; lastVSNotify dedupes per project.
     private func processVSCodeAttention(_ events: [AwakeMonitor.VSCodeAttention]) {
+        let center = UNUserNotificationCenter.current()
+        // Withdraw a delivered prompt alert once that same event shows resolved —
+        // you answered it in the editor and the session is running again. The
+        // resolve markers are recomputed per poll by collectVSCodeAttention, so the
+        // line we alerted on reappears flipped to resolved while still within the
+        // 5-minute freshness window.
+        if autoClearAlerts {
+            for ev in events where ev.resolved {
+                if let entry = deliveredVSCode[ev.project], entry.time == ev.time {
+                    center.removeDeliveredNotifications(withIdentifiers: [entry.id])
+                    deliveredVSCode[ev.project] = nil
+                }
+            }
+        }
         let ripe = Date().addingTimeInterval(-attentionGrace)
         for ev in events.sorted(by: { $0.time < $1.time }) {
             let last = lastVSNotify[ev.project] ?? appLaunch
             guard ev.time > last, ev.time <= ripe else { continue }
             lastVSNotify[ev.project] = ev.time
             if ev.resolved { continue }
+            let id = "vscode-\(ev.project)-\(Int(ev.time.timeIntervalSince1970))"
             postAttentionNotification(
-                project: ev.project, message: ev.message,
-                id: "vscode-\(ev.project)-\(Int(ev.time.timeIntervalSince1970))", cwd: nil)
+                project: ev.project, message: ev.message, id: id, cwd: nil)
+            deliveredVSCode[ev.project] = (id, ev.time)
         }
     }
 
