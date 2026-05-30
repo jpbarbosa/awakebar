@@ -25,12 +25,19 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleExecutable</key><string>AwakeBar</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>LSMinimumSystemVersion</key><string>15.0</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>
 PLIST
+
+# Bundle the app icon (shown in Finder / Applications; the app is accessory, so
+# it has no Dock icon). icon/AppIcon.icns is prebuilt by icon/build-iconset.sh —
+# re-run that to regenerate after editing the artwork.
+mkdir -p "$APP/Contents/Resources"
+cp icon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 # Sign with a code-signing identity discovered from the local keychain, so
 # rebuilds keep a stable signature (login-item registration and granted

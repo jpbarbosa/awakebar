@@ -70,6 +70,15 @@ Builds and signs `AwakeBar.app`. For the first install, drag it to
 only in the menu bar, no Dock icon. After that, `./build.sh` keeps the
 installed copy in sync on every rebuild.
 
+The app icon — a coffee cup on a Liquid-Glass-style squircle — is assembled in
+`icon/make-icon.swift`: the tile (squircle, gloss, sheen) is drawn in Core
+Graphics and the cup (`icon/black-coffee-cup.png`, a transparent 3D render) is
+composited on top with a soft drop shadow. It's deliberately not the SF Symbol
+`cup.and.saucer` — Apple's SF Symbols licence bars its symbols from app icons;
+if the PNG is removed it falls back to a drawn vector cup. `build.sh` bundles the
+prebuilt `icon/AppIcon.icns`; re-run `./icon/build-iconset.sh <style>`
+(`espresso` · `aqua` · `graphite`) to regenerate the tile palette.
+
 ## The Claude Code hook (optional)
 
 `keep-awake.sh` is the paired Claude Code hook: it runs a `caffeinate` while
