@@ -259,7 +259,8 @@ enum AwakeMonitor {
 
     // Parse the leading "yyyy-MM-dd HH:mm:ss.SSS" timestamp of a log line, nil if
     // the line doesn't start with one (e.g. a wrapped continuation line).
-    private static func lineTime(_ line: Substring) -> Date? {
+    // (internal, not private, so AwakeBarTests can exercise the parser directly.)
+    static func lineTime(_ line: Substring) -> Date? {
         let c = Array(line.prefix(23))
         guard c.count == 23 else { return nil }
         func n(_ a: Int, _ b: Int) -> Int? { Int(String(c[a..<b])) }
@@ -274,7 +275,8 @@ enum AwakeMonitor {
 
     // Extract the "message":"…" value from a show_notification line (the messages
     // hold no embedded quotes, so the first closing quote ends it).
-    private static func notifyMessage(in line: Substring) -> String? {
+    // (internal, not private, so AwakeBarTests can exercise the parser directly.)
+    static func notifyMessage(in line: Substring) -> String? {
         guard let r = line.range(of: "\"message\":\"") else { return nil }
         let rest = line[r.upperBound...]
         guard let end = rest.firstIndex(of: "\"") else { return nil }
@@ -339,7 +341,8 @@ enum AwakeMonitor {
     // the tail (handshake scrolled off) but bridge traffic is present, that's a
     // connected session past its handshake. The label is the basename of the
     // most recent cwd in the tail, or a generic name if none survived.
-    private static func connectedProject(inTailOf path: String) -> String? {
+    // (internal, not private, so AwakeBarTests can drive it with sample logs.)
+    static func connectedProject(inTailOf path: String) -> String? {
         guard let data = tailData(ofFile: path, maxBytes: 1 << 21) else { return nil }
 
         func lastIndex(of marker: String) -> Int? {
@@ -371,7 +374,8 @@ enum AwakeMonitor {
     // must NOT be mistaken for the session's real cwd. Echoed JSON is escaped
     // (`\"cwd\":\"`), so the unescaped `"cwd":"` only appears in the real
     // message; and the full spawn phrase is the extension's own log string.
-    private static func lastCwd(in data: Data) -> String? {
+    // (internal, not private, so AwakeBarTests can exercise the parser directly.)
+    static func lastCwd(in data: Data) -> String? {
         func cwd(after anchor: String, stop: UInt8) -> (pos: Int, path: String)? {
             guard let r = data.range(of: Data(anchor.utf8), options: .backwards)
             else { return nil }
@@ -399,7 +403,8 @@ enum AwakeMonitor {
     }
 
     // Parses a `pmset` per-process line: "   pid 123(name): [...] ...".
-    private static func parseHolder(line: String) -> (pid: Int, name: String)? {
+    // (internal, not private, so AwakeBarTests can exercise the parser directly.)
+    static func parseHolder(line: String) -> (pid: Int, name: String)? {
         guard let open = line.firstIndex(of: "(") else { return nil }
         let afterOpen = line.index(after: open)
         guard let close = line[afterOpen...].firstIndex(of: ")") else { return nil }

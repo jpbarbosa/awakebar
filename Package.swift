@@ -5,6 +5,8 @@ let package = Package(
     name: "AwakeBar",
     platforms: [.macOS(.v15)],
     targets: [
-        .executableTarget(name: "AwakeBar", path: "Sources/AwakeBar")
+        .executableTarget(name: "AwakeBar", path: "Sources/AwakeBar"),
+        .testTarget(name: "AwakeBarTests", dependencies: ["AwakeBar"],
+                    path: "Tests/AwakeBarTests"),
     ]
 )
