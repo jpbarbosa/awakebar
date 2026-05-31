@@ -87,9 +87,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     // Center. Terminal path: keyed by cwd → (id, event ts), cleared when that
     // cwd's activity marker passes ts — the same "you're on it" signal
     // fireIfStillWaiting uses to suppress the alert before it fires. VSCode path:
-    // keyed by project → (id, event time), cleared when that event shows resolved.
+    // keyed by project → a LIST of (id, event time), cleared per-entry when that
+    // event shows resolved or ages out (see clearResumedAttentions). A list, not
+    // one tuple, so two prompts in the same project don't orphan the earlier id —
+    // that orphaning is what left duplicate banners stuck in Notification Center.
     private var deliveredByCwd: [String: (id: String, ts: Int)] = [:]
-    private var deliveredVSCode: [String: (id: String, time: Date)] = [:]
+    private var deliveredVSCode: [String: [(id: String, time: Date)]] = [:]
+    // A delivered VSCode alert whose event has aged past this without ever showing
+    // resolved (e.g. a permission prompt you denied or ignored, which logs no
+    // resolve marker) is withdrawn as stale — it matches the freshness window past
+    // which collectVSCodeAttention stops emitting the event, so no later resolve
+    // can arrive to clear it the normal way.
+    private static let staleVSCodeAlertAge: TimeInterval = 5 * 60
     // Delivered "Task finished" banners, withdrawn the same way as the terminal
     // waiting alerts: keyed by cwd → (id, done ts), cleared once that cwd's
     // activity marker passes ts (you sent a new prompt = resumed the session).
@@ -669,6 +678,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private func setUpNotifications() {
         let center = UNUserNotificationCenter.current()
         center.delegate = self
+        // Drop any banners left over from a previous run. The deliveredByCwd /
+        // deliveredVSCode tracking maps are in-memory, so anything delivered before
+        // this launch is untrackable and could never be withdrawn — a guaranteed
+        // zombie. Honor the toggle: with auto-clear off we promise never to withdraw.
+        if autoClearAlerts { center.removeAllDeliveredNotifications() }
         center.requestAuthorization(options: [.alert, .sound]) { granted, error in
             if let error {
                 NSLog("AwakeBar: notification auth error: %@", error.localizedDescription)
@@ -783,6 +797,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             center.removeDeliveredNotifications(withIdentifiers: [entry.id])
             deliveredDoneByCwd[cwd] = nil
         }
+        // VSCode permission alerts that never showed resolved (denied/ignored
+        // prompts log no resolve marker) would otherwise linger forever once their
+        // event ages out of the freshness window. Sweep those stale banners by age.
+        let staleCut = Date().addingTimeInterval(-Self.staleVSCodeAlertAge)
+        for (project, entries) in deliveredVSCode {
+            let stale = entries.filter { $0.time < staleCut }
+            guard !stale.isEmpty else { continue }
+            center.removeDeliveredNotifications(withIdentifiers: stale.map(\.id))
+            let rest = entries.filter { $0.time >= staleCut }
+            deliveredVSCode[project] = rest.isEmpty ? nil : rest
+        }
     }
 
     // VSCode path: alert on each attention event once it is at least attentionGrace
@@ -797,10 +822,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // 5-minute freshness window.
         if autoClearAlerts {
             for ev in events where ev.resolved {
-                if let entry = deliveredVSCode[ev.project], entry.time == ev.time {
-                    center.removeDeliveredNotifications(withIdentifiers: [entry.id])
-                    deliveredVSCode[ev.project] = nil
-                }
+                guard let entries = deliveredVSCode[ev.project] else { continue }
+                let hit = entries.filter { $0.time == ev.time }
+                guard !hit.isEmpty else { continue }
+                center.removeDeliveredNotifications(withIdentifiers: hit.map(\.id))
+                let rest = entries.filter { $0.time != ev.time }
+                deliveredVSCode[ev.project] = rest.isEmpty ? nil : rest
             }
         }
         let ripe = Date().addingTimeInterval(-attentionGrace)
@@ -812,7 +839,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             let id = "vscode-\(ev.project)-\(Int(ev.time.timeIntervalSince1970))"
             postAttentionNotification(
                 project: ev.project, message: ev.message, id: id, cwd: nil)
-            deliveredVSCode[ev.project] = (id, ev.time)
+            deliveredVSCode[ev.project, default: []].append((id, ev.time))
         }
     }
 
