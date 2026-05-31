@@ -1,11 +1,17 @@
 # AwakeBar
 
-A tiny macOS menu bar app that shows, at a glance, whether something is
-deliberately keeping your Mac awake — with first-class awareness of the
-Claude Code CLI. It can also **notify you when Claude is waiting on you** (a
-permission prompt, or an idle session) and **when a long task finishes**, so you
-can step away and get pulled back the moment Claude needs a decision — or the
-moment the work is done.
+A tiny macOS menu bar app that keeps your Claude Code sessions from being
+interrupted — and pulls *you* back the moment they need you. It **notifies you
+when Claude is waiting** (a permission prompt, or an idle session) and **when a
+long task finishes**, so you can step away and get pulled back the moment Claude
+needs a decision — or the moment the work is done. It also keeps your Mac awake
+so a session driven from claude.ai or mobile can't be dropped by idle sleep in
+the gap between turns.
+
+It does all this from a coffee cup in the menu bar that doubles as an honest,
+*whole-system* sleep indicator: because it reads `pmset` assertions, a filled
+cup means **anything** on the machine is deliberately holding it awake — not just
+AwakeBar's own hold, unlike KeepingYouAwake or Amphetamine.
 
 ![AwakeBar showing the menu bar dropdown next to a Claude Code session](awakebar.webp)
 
@@ -55,107 +61,6 @@ The controls are **Force Stay Awake** (a manual hold that red-badges the cup),
 **Notify When Task Finishes**, **Clear Notifications When Resumed**,
 **Notification Delay**, **Remote Idle Timeout**, **Open at Login**, and **Quit**
 — each covered below.
-
-State comes from `pmset -g assertions`, so it reflects the *whole system* —
-unlike KeepingYouAwake or Amphetamine, whose icon only tracks their own
-assertion. It counts the three assertion types that keep the *machine* awake
-(`PreventUserIdleSystemSleep`, `PreventSystemSleep`, and the
-`NoIdleSleepAssertion` that Electron's `powerSaveBlocker` registers — e.g.
-Claude Desktop's own keep-awake). Ambient daemons (`powerd`, `bluetoothd`,
-`sharingd`) are filtered out so a filled cup means something deliberate.
-
-AwakeBar is mostly an *observer* — it reads the system's assertions rather than
-creating them. It holds its own `PreventUserIdleSystemSleep` assertion (the Mac
-stays awake; the display may still sleep) in two cases:
-
-- **Remote Control** — automatically, while a bridge is connected, so a session
-  driven from claude.ai / mobile can't be dropped by idle sleep in the gap
-  between turns when the keep-awake hook isn't holding one. This hold is capped
-  by the **Remote Idle Timeout** (see below) so an abandoned remote session
-  doesn't keep the Mac awake forever.
-- **Keep awake** — a manual menu toggle to force the Mac awake regardless of
-  Claude. It resets to off on each launch, and the menu-bar cup gets a small
-  **red badge** while it's on.
-
-### Remote Idle Timeout
-
-A remote session that's been left idle shouldn't keep the Mac awake
-indefinitely. The **Remote Idle Timeout** menu (Off / 30 min / 1 hr / 2 hr,
-default **1 hr**) releases the Remote Control hold once a connected session has
-seen no activity (no prompt, tool use, or turn) for that long — a new turn
-resets the timer. When it fires, the menu shows **Remote control: idle (sleep
-allowed)** and the Mac can sleep normally.
-
-Because the keep-awake hook *also* holds the Mac awake between turns for a
-remote session, this only delivers a true cap end-to-end: AwakeBar publishes the
-chosen window to `/tmp/claude-keep-awake.idle`, and `keep-awake.sh` restarts its
-between-turns `caffeinate` with that as its `-t`, so the hook's own hold expires
-on the same window instead of its 4 h backstop. Set the timeout to **Off** to
-restore the old behavior (held as long as the bridge is connected; hook caps at
-4 h/prompt). The idle signal comes from `notify-attention.sh`'s per-cwd activity
-markers, so that hook must be installed for sub-4 h capping to apply.
-
-Either assertion is filtered out of AwakeBar's own holder list (so it never
-circularly lists itself) and surfaced instead under **Kept awake by:** as
-*AwakeBar (Remote Control session)* / *AwakeBar (manual)*.
-
-## Build & install
-
-Requires macOS 15+ and Swift 6.2.
-
-```sh
-./build.sh
-```
-
-Builds and signs `AwakeBar.app`. For the first install, drag it to
-`/Applications`, open it, and pick **Open at Login** from its menu — it lives
-only in the menu bar, no Dock icon. After that, `./build.sh` keeps the
-installed copy in sync on every rebuild.
-
-The source lives in `Sources/AwakeBar/`, one file per type (`AwakeMonitor`,
-`PowerAssertion`, `AttentionWatcher`, `AppDelegate`, and the `main` entry
-point). `swift test` runs the unit tests covering the `pmset` and VSCode-log
-parsers in `AwakeMonitor`.
-
-The app icon — a coffee cup on a Liquid-Glass-style squircle — is assembled in
-`icon/make-icon.swift`: the tile (squircle, gloss, sheen) is drawn in Core
-Graphics and the cup (`icon/black-coffee-cup.png`, a transparent 3D render) is
-composited on top with a soft drop shadow. It's deliberately not the SF Symbol
-`cup.and.saucer` — Apple's SF Symbols licence bars its symbols from app icons;
-if the PNG is removed it falls back to a drawn vector cup. `build.sh` bundles the
-prebuilt `icon/AppIcon.icns`; re-run `./icon/build-iconset.sh <style>`
-(`espresso` · `aqua` · `graphite`) to regenerate the tile palette.
-
-## The Claude Code hook (optional)
-
-`keep-awake.sh` is the paired Claude Code hook: it runs a `caffeinate` while
-Claude is working and stops when the turn ends — and for a **Remote Control**
-session it keeps the Mac awake *between* turns too, so a session driven from
-claude.ai or mobile isn't killed by the Mac sleeping. The between-turns hold is
-bounded: each turn restarts `caffeinate` with `-t` set to the idle window
-AwakeBar publishes at `/tmp/claude-keep-awake.idle` (default 4 h when that file
-is absent), so an idle remote session stops holding once the window passes with
-no new turn. Install it by copying the script to `~/.claude/` (and `chmod +x`
-it), then wiring it into `~/.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "SessionStart":    [{ "hooks": [{ "type": "command", "command": "~/.claude/keep-awake.sh", "async": true }] }],
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "~/.claude/keep-awake.sh" }] }],
-    "Stop":            [{ "hooks": [{ "type": "command", "command": "~/.claude/keep-awake.sh" }] }],
-    "SessionEnd":      [{ "hooks": [{ "type": "command", "command": "~/.claude/keep-awake.sh" }] }]
-  }
-}
-```
-
-`SessionStart` is wired `async` so a Remote Control session is held from the
-moment it connects, not just from the first turn. While caffeinate runs the
-hook records *why* in `/tmp/claude-keep-awake.reason` (`turn` or `remote`),
-which is what drives the **Claude Code hook** line's wording.
-
-The app and the hook are independent — the app works on its own; the hook is
-what makes the **Claude Code hook** line light up.
 
 ## Notifications when Claude needs you
 
@@ -253,7 +158,110 @@ you switched to a second VSCode window to keep working, you're *not* idle, so an
 idle-gated alert would never fire in exactly the case you wanted it. Turn length
 is the signal that actually tracks "this was a task worth announcing."
 
-### How Remote Control is detected
+## The Claude Code hook (optional)
+
+`keep-awake.sh` is the paired Claude Code hook: it runs a `caffeinate` while
+Claude is working and stops when the turn ends — and for a **Remote Control**
+session it keeps the Mac awake *between* turns too, so a session driven from
+claude.ai or mobile isn't killed by the Mac sleeping. The between-turns hold is
+bounded: each turn restarts `caffeinate` with `-t` set to the idle window
+AwakeBar publishes at `/tmp/claude-keep-awake.idle` (default 4 h when that file
+is absent), so an idle remote session stops holding once the window passes with
+no new turn. Install it by copying the script to `~/.claude/` (and `chmod +x`
+it), then wiring it into `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart":    [{ "hooks": [{ "type": "command", "command": "~/.claude/keep-awake.sh", "async": true }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "~/.claude/keep-awake.sh" }] }],
+    "Stop":            [{ "hooks": [{ "type": "command", "command": "~/.claude/keep-awake.sh" }] }],
+    "SessionEnd":      [{ "hooks": [{ "type": "command", "command": "~/.claude/keep-awake.sh" }] }]
+  }
+}
+```
+
+`SessionStart` is wired `async` so a Remote Control session is held from the
+moment it connects, not just from the first turn. While caffeinate runs the
+hook records *why* in `/tmp/claude-keep-awake.reason` (`turn` or `remote`),
+which is what drives the **Claude Code hook** line's wording.
+
+The app and the hook are independent — the app works on its own; the hook is
+what makes the **Claude Code hook** line light up.
+
+## Build & install
+
+Requires macOS 15+ and Swift 6.2.
+
+```sh
+./build.sh
+```
+
+Builds and signs `AwakeBar.app`. For the first install, drag it to
+`/Applications`, open it, and pick **Open at Login** from its menu — it lives
+only in the menu bar, no Dock icon. After that, `./build.sh` keeps the
+installed copy in sync on every rebuild.
+
+The source lives in `Sources/AwakeBar/`, one file per type (`AwakeMonitor`,
+`PowerAssertion`, `AttentionWatcher`, `AppDelegate`, and the `main` entry
+point). `swift test` runs the unit tests covering the `pmset` and VSCode-log
+parsers in `AwakeMonitor`.
+
+The app icon — a coffee cup on a Liquid-Glass-style squircle — is assembled in
+`icon/make-icon.swift`: the tile (squircle, gloss, sheen) is drawn in Core
+Graphics and the cup (`icon/black-coffee-cup.png`, a transparent 3D render) is
+composited on top with a soft drop shadow. It's deliberately not the SF Symbol
+`cup.and.saucer` — Apple's SF Symbols licence bars its symbols from app icons;
+if the PNG is removed it falls back to a drawn vector cup. `build.sh` bundles the
+prebuilt `icon/AppIcon.icns`; re-run `./icon/build-iconset.sh <style>`
+(`espresso` · `aqua` · `graphite`) to regenerate the tile palette.
+
+## How the awake detection works
+
+State comes from `pmset -g assertions`, so it reflects the *whole system* —
+unlike KeepingYouAwake or Amphetamine, whose icon only tracks their own
+assertion. It counts the three assertion types that keep the *machine* awake
+(`PreventUserIdleSystemSleep`, `PreventSystemSleep`, and the
+`NoIdleSleepAssertion` that Electron's `powerSaveBlocker` registers — e.g.
+Claude Desktop's own keep-awake). Ambient daemons (`powerd`, `bluetoothd`,
+`sharingd`) are filtered out so a filled cup means something deliberate.
+
+AwakeBar is mostly an *observer* — it reads the system's assertions rather than
+creating them. It holds its own `PreventUserIdleSystemSleep` assertion (the Mac
+stays awake; the display may still sleep) in two cases:
+
+- **Remote Control** — automatically, while a bridge is connected, so a session
+  driven from claude.ai / mobile can't be dropped by idle sleep in the gap
+  between turns when the keep-awake hook isn't holding one. This hold is capped
+  by the **Remote Idle Timeout** (see below) so an abandoned remote session
+  doesn't keep the Mac awake forever.
+- **Keep awake** — a manual menu toggle to force the Mac awake regardless of
+  Claude. It resets to off on each launch, and the menu-bar cup gets a small
+  **red badge** while it's on.
+
+### Remote Idle Timeout
+
+A remote session that's been left idle shouldn't keep the Mac awake
+indefinitely. The **Remote Idle Timeout** menu (Off / 30 min / 1 hr / 2 hr,
+default **1 hr**) releases the Remote Control hold once a connected session has
+seen no activity (no prompt, tool use, or turn) for that long — a new turn
+resets the timer. When it fires, the menu shows **Remote control: idle (sleep
+allowed)** and the Mac can sleep normally.
+
+Because the keep-awake hook *also* holds the Mac awake between turns for a
+remote session, this only delivers a true cap end-to-end: AwakeBar publishes the
+chosen window to `/tmp/claude-keep-awake.idle`, and `keep-awake.sh` restarts its
+between-turns `caffeinate` with that as its `-t`, so the hook's own hold expires
+on the same window instead of its 4 h backstop. Set the timeout to **Off** to
+restore the old behavior (held as long as the bridge is connected; hook caps at
+4 h/prompt). The idle signal comes from `notify-attention.sh`'s per-cwd activity
+markers, so that hook must be installed for sub-4 h capping to apply.
+
+Either assertion is filtered out of AwakeBar's own holder list (so it never
+circularly lists itself) and surfaced instead under **Kept awake by:** as
+*AwakeBar (Remote Control session)* / *AwakeBar (manual)*.
+
+## How Remote Control is detected
 
 Claude Code no longer records Remote Control state in a file AwakeBar can read
 (the old `~/.claude/sessions/<pid>.json` `bridgeSessionId` field is gone), and
