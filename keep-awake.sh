@@ -14,7 +14,13 @@
 #  * One shared caffeinate, tracked in a single fixed pidfile, plus a sibling
 #    ".reason" file holding "turn" or "remote" so a menu-bar app can show *why*
 #    the Mac is being kept awake. Each UserPromptSubmit replaces the previous
-#    caffeinate; a 4h -t cap means nothing can leak indefinitely.
+#    caffeinate; a 4h -t cap means a turn can never leak indefinitely.
+#  * A remote session is held only between turns: each Stop restarts caffeinate
+#    with -t set to a short idle window, so an idle remote session stops keeping
+#    the Mac awake once that window passes without a new turn. The window is read
+#    from /tmp/claude-keep-awake.idle (seconds), which AwakeBar writes from its
+#    "Remote Idle Timeout" setting; absent/invalid falls back to the 4h cap, so
+#    behaviour is unchanged when AwakeBar isn't managing it.
 #  * Remote Control detection: Claude Code no longer records bridge state in
 #    ~/.claude/sessions/<pid>.json, so we read the bridge lifecycle out of the
 #    VSCode extension-host debug log — the only on-disk trace. Best-effort:
@@ -38,6 +44,19 @@ fi
 
 pidfile="${CLAUDE_KEEP_AWAKE_PIDFILE:-/tmp/claude-keep-awake.pid}"
 reasonfile="${pidfile%.pid}.reason"
+idlefile="${pidfile%.pid}.idle"
+
+# Seconds to hold a remote session between turns, written by AwakeBar's "Remote
+# Idle Timeout" setting. Absent or non-numeric falls back to the 4h turn cap, so
+# the hook behaves exactly as before when AwakeBar isn't managing the window.
+remote_idle_seconds() {
+  local v
+  v=$(cat "$idlefile" 2>/dev/null)
+  case "$v" in
+    ''|*[!0-9]*) printf '14400' ;;
+    *)           printf '%s' "$v" ;;
+  esac
+}
 
 kill_tracked() {
   if [ -f "$pidfile" ]; then
@@ -47,16 +66,14 @@ kill_tracked() {
   rm -f "$reasonfile"
 }
 
-caffeinate_alive() {
-  [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null
-}
-
-# start <reason> — (re)start caffeinate and record why the Mac is held awake.
+# start <reason> [seconds] — (re)start caffeinate and record why the Mac is held
+# awake. The optional cap defaults to 4h: long enough that a single turn never
+# trips it, and a backstop so a missed Stop can never leak indefinitely.
 start() {
   kill_tracked
+  local cap="${2:-14400}"
   # -i no idle sleep, -m no disk sleep, -s no system sleep (AC only).
-  # -t 14400: hard 4h cap so a missed Stop can never leak indefinitely.
-  nohup caffeinate -i -m -s -t 14400 >/dev/null 2>&1 &
+  nohup caffeinate -i -m -s -t "$cap" >/dev/null 2>&1 &
   echo $! > "$pidfile"
   disown 2>/dev/null || true
   printf '%s' "$1" > "$reasonfile"
@@ -92,7 +109,7 @@ case "$event" in
     # starts; poll briefly so a remote session is held from the start.
     # Wired async in settings.json, so this never delays session startup.
     for _ in $(seq 1 15); do
-      if remote_control_active; then start remote; break; fi
+      if remote_control_active; then start remote "$(remote_idle_seconds)"; break; fi
       sleep 1
     done
     ;;
@@ -101,13 +118,11 @@ case "$event" in
     ;;
   Stop)
     if remote_control_active; then
-      # Turn ended, but the session is remote-controlled — stay awake and
-      # relabel the reason (re-arm caffeinate if it somehow stopped).
-      if caffeinate_alive; then
-        printf 'remote' > "$reasonfile"
-      else
-        start remote
-      fi
+      # Turn ended, but the session is remote-controlled — keep the Mac awake,
+      # restarting caffeinate with the idle window as its -t. Each turn refreshes
+      # this; once a window passes with no new turn, caffeinate exits on its own
+      # and the idle remote session stops holding the Mac awake.
+      start remote "$(remote_idle_seconds)"
     else
       kill_tracked
     fi

@@ -147,12 +147,14 @@ import Foundation
         body(path)
     }
 
-    @Test func connectedReturnsProjectBasename() {
+    @Test func connectedReturnsProjectAndCwd() {
         withLog("""
         2026-05-30 14:00:00.000 [remote-bridge] v2 transport connected
         2026-05-30 14:00:01.000 Spawning Claude with SDK query function - cwd: /Users/jp/Sites/awakebar, x
         """) { path in
-            #expect(AwakeMonitor.connectedProject(inTailOf: path) == "awakebar")
+            let session = AwakeMonitor.connectedProject(inTailOf: path)
+            #expect(session?.project == "awakebar")
+            #expect(session?.cwd == "/Users/jp/Sites/awakebar")
         }
     }
 
@@ -173,7 +175,7 @@ import Foundation
         2026-05-30 14:00:00.000 [remote-bridge] forwarding message
         2026-05-30 14:00:01.000 {"cwd":"/Users/jp/proj"}
         """) { path in
-            #expect(AwakeMonitor.connectedProject(inTailOf: path) == "proj")
+            #expect(AwakeMonitor.connectedProject(inTailOf: path)?.project == "proj")
         }
     }
 
@@ -184,5 +186,71 @@ import Foundation
         """) { path in
             #expect(AwakeMonitor.connectedProject(inTailOf: path) == nil)
         }
+    }
+}
+
+// MARK: - shouldHoldRemote (the remote idle-cap decision)
+
+@Suite struct ShouldHoldRemoteTests {
+    private let now = Date(timeIntervalSince1970: 1_000_000)
+    private func ago(_ seconds: TimeInterval) -> Date { now.addingTimeInterval(-seconds) }
+
+    @Test func notConnectedNeverHolds() {
+        #expect(AwakeMonitor.shouldHoldRemote(
+            connected: false, timeout: 3600, lastActivity: now, now: now,
+            hookActive: false) == false)
+    }
+
+    @Test func timeoutOffAlwaysHoldsWhileConnected() {
+        // Off (0) disables the cap — even ancient activity keeps the hold.
+        #expect(AwakeMonitor.shouldHoldRemote(
+            connected: true, timeout: 0, lastActivity: ago(99_999), now: now,
+            hookActive: false) == true)
+    }
+
+    @Test func liveHookTurnHolds() {
+        // A turn is running; never release mid-turn regardless of marker age.
+        #expect(AwakeMonitor.shouldHoldRemote(
+            connected: true, timeout: 3600, lastActivity: ago(99_999), now: now,
+            hookActive: true) == true)
+    }
+
+    @Test func recentActivityHolds() {
+        #expect(AwakeMonitor.shouldHoldRemote(
+            connected: true, timeout: 3600, lastActivity: ago(60), now: now,
+            hookActive: false) == true)
+    }
+
+    @Test func idlePastTimeoutReleases() {
+        #expect(AwakeMonitor.shouldHoldRemote(
+            connected: true, timeout: 3600, lastActivity: ago(3601), now: now,
+            hookActive: false) == false)
+    }
+
+    @Test func noActivitySignalHolds() {
+        // Without any activity signal we can't prove idleness — don't force sleep.
+        #expect(AwakeMonitor.shouldHoldRemote(
+            connected: true, timeout: 3600, lastActivity: nil, now: now,
+            hookActive: false) == true)
+    }
+}
+
+// MARK: - activityTs
+
+@Suite struct ActivityTsTests {
+    @Test func readsAndSanitizesMarker() {
+        // notify-attention.sh keys markers by cwd with non-alphanumerics -> '_'.
+        let cwd = "/Users/jp/Sites/awakebar-\(ProcessInfo.processInfo.globallyUniqueString)"
+        var safe = ""
+        for ch in cwd { safe.append(ch.isASCII && (ch.isLetter || ch.isNumber) ? ch : "_") }
+        let path = "/tmp/claude-activity-" + safe
+        try? "1700000000".write(toFile: path, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        #expect(AwakeMonitor.activityTs(forCwd: cwd) == 1_700_000_000)
+    }
+
+    @Test func missingMarkerIsZero() {
+        let cwd = "/nope/\(ProcessInfo.processInfo.globallyUniqueString)"
+        #expect(AwakeMonitor.activityTs(forCwd: cwd) == 0)
     }
 }

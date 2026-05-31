@@ -49,6 +49,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private static let graceChoices: [TimeInterval] = [5, 10]
     private var attentionGrace: TimeInterval = 10
 
+    // How long a remote-controlled session may stay idle (no prompt/tool/stop
+    // activity) before AwakeBar releases its remote hold and lets the Mac sleep.
+    // The "Remote Idle Timeout" submenu picks from remoteIdleChoices; 0 = Off
+    // (hold as long as the bridge is connected). Persisted; default 1h. AwakeBar
+    // also writes the chosen window to idleWindowFile so keep-awake.sh's own
+    // between-turns caffeinate expires on the same window (see writeIdleWindow).
+    private static let remoteIdleKey = "remoteIdleTimeoutSeconds"
+    private static let remoteIdleChoices: [(label: String, seconds: TimeInterval)] =
+        [("Off", 0), ("30 Minutes", 1800), ("1 Hour", 3600), ("2 Hours", 7200)]
+    private static let idleWindowFile = "/tmp/claude-keep-awake.idle"
+    private var remoteIdleTimeout: TimeInterval = 3600
+
     // VSCode permission prompts surfaced via the extension log (see AwakeMonitor).
     // appLaunch floors out events logged before launch; lastVSNotify is the
     // per-project high-water of handled events so none is alerted twice.
@@ -75,10 +87,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // bool(forKey:) return true when the user has never set it, so the default
         // stays on.
         UserDefaults.standard.register(defaults: [Self.autoClearKey: true,
-                                                  Self.graceKey: 10.0])
+                                                  Self.graceKey: 10.0,
+                                                  Self.remoteIdleKey: 3600.0])
         autoClearAlerts = UserDefaults.standard.bool(forKey: Self.autoClearKey)
         let savedGrace = UserDefaults.standard.double(forKey: Self.graceKey)
         attentionGrace = Self.graceChoices.contains(savedGrace) ? savedGrace : 10
+        let savedIdle = UserDefaults.standard.double(forKey: Self.remoteIdleKey)
+        remoteIdleTimeout = Self.remoteIdleChoices.contains { $0.seconds == savedIdle }
+            ? savedIdle : 3600
+        writeIdleWindow()   // publish the window for keep-awake.sh before any turn
 
         // Create the status item HERE, not in a property initializer — doing it
         // before the app finishes launching can leave the item not displayed.
@@ -143,12 +160,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private func apply(_ snapshot: AwakeMonitor.Snapshot) {
         snap = snapshot
         if snapshot.hookActive { hookLastActive = Date() }
-        // Track Remote Control automatically; the manual hold is driven by the
-        // menu toggle. Then reflect everything in the icon and menu.
-        remoteAssertion.set(snapshot.remoteControlActive)
+        // Track Remote Control automatically, but drop the hold once the session
+        // has been idle past the timeout so the Mac can sleep (the manual hold is
+        // driven by the menu toggle). Then reflect everything in the icon/menu.
+        remoteAssertion.set(shouldHoldRemote(snapshot))
         processVSCodeAttention(snapshot.vscodeAttention)
         clearResumedAttentions()
         render()
+    }
+
+    // Whether to keep AwakeBar's remote hold for this snapshot. Idle is measured
+    // against the most recent session activity (per-cwd markers) and the last
+    // observed hook turn, so a live turn or recent prompt keeps it held.
+    private func shouldHoldRemote(_ snapshot: AwakeMonitor.Snapshot) -> Bool {
+        let lastActivity = [snapshot.remoteLastActivity, hookLastActive]
+            .compactMap { $0 }.max()
+        return AwakeMonitor.shouldHoldRemote(
+            connected: snapshot.remoteControlActive, timeout: remoteIdleTimeout,
+            lastActivity: lastActivity, now: Date(), hookActive: snapshot.hookActive)
+    }
+
+    // Publish the idle window for keep-awake.sh: it restarts its between-turns
+    // caffeinate with -t = this many seconds, so the hook's own hold expires on
+    // the same window. Off removes the file, restoring the hook's default 4h cap.
+    private func writeIdleWindow() {
+        if remoteIdleTimeout > 0 {
+            try? String(Int(remoteIdleTimeout)).write(
+                toFile: Self.idleWindowFile, atomically: true, encoding: .utf8)
+        } else {
+            try? FileManager.default.removeItem(atPath: Self.idleWindowFile)
+        }
     }
 
     // Reflect current state — the snapshot plus the assertions we hold — in the
@@ -260,6 +301,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             String(manualAssertion.held),
             String(autoClearAlerts),
             String(attentionGrace),
+            String(remoteIdleTimeout),
             snap.remoteProjects.joined(separator: ","),
             holders,
         ].joined(separator: "~")
@@ -287,8 +329,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         menu.addItem(infoItem(claudeHookStatusText(), color: .secondaryLabelColor,
                               status: snap.hookActive))
         if snap.remoteControlActive {
-            menu.addItem(infoItem("Remote Control: Active", color: .secondaryLabelColor,
-                                  status: true))
+            // Connected but the hold released means the session went idle past the
+            // timeout — the bridge is still up, we've just stopped forcing awake.
+            let idle = !remoteAssertion.held
+            menu.addItem(infoItem(idle ? "Remote Control: idle (sleep allowed)"
+                                       : "Remote Control: Active",
+                                  color: .secondaryLabelColor, status: !idle))
             for project in snap.remoteProjects {
                 menu.addItem(infoItem(project, color: .secondaryLabelColor, indent: 1))
             }
@@ -353,6 +399,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         delay.submenu = delaySub
         delay.image = spacerSlot()
         menu.addItem(delay)
+
+        // How long a remote session may idle before the Mac is allowed to sleep —
+        // a turn or prompt resets the timer. A checkmark marks the active choice.
+        let idleTimeout = NSMenuItem(title: "Remote Idle Timeout", action: nil,
+                                     keyEquivalent: "")
+        idleTimeout.toolTip = "Let the Mac sleep after this long with no activity on a remote-controlled session (a turn resets the timer). Off keeps it awake as long as the bridge is connected."
+        let idleSub = NSMenu()
+        idleSub.autoenablesItems = false
+        for choice in Self.remoteIdleChoices {
+            let item = NSMenuItem(title: choice.label,
+                                  action: #selector(setRemoteIdle(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = Int(choice.seconds)
+            item.state = remoteIdleTimeout == choice.seconds ? .on : .off
+            idleSub.addItem(item)
+        }
+        idleTimeout.submenu = idleSub
+        idleTimeout.image = spacerSlot()
+        menu.addItem(idleTimeout)
 
         let login = NSMenuItem(title: "Open at Login",
                                action: #selector(toggleLogin), keyEquivalent: "")
@@ -517,6 +582,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         render()
     }
 
+    // Pick the remote idle timeout. Persists, republishes the window for the hook,
+    // and re-evaluates the hold right away so the change takes effect immediately.
+    @objc private func setRemoteIdle(_ sender: NSMenuItem) {
+        let seconds = TimeInterval(sender.tag)
+        guard seconds != remoteIdleTimeout else { return }
+        remoteIdleTimeout = seconds
+        UserDefaults.standard.set(seconds, forKey: Self.remoteIdleKey)
+        writeIdleWindow()
+        remoteAssertion.set(shouldHoldRemote(snap))
+        render()
+    }
+
     @objc private func quit() {
         remoteAssertion.set(false)   // don't leak assertions
         manualAssertion.set(false)
@@ -629,13 +706,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     // Last activity time for a session, written per-cwd by notify-attention.sh.
-    // The sanitiser mirrors the hook's `tr -c 'A-Za-z0-9' '_'`.
     private func activityTs(forCwd cwd: String) -> Int {
-        var safe = ""
-        for ch in cwd { safe.append(ch.isASCII && (ch.isLetter || ch.isNumber) ? ch : "_") }
-        let path = "/tmp/claude-activity-" + safe
-        guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { return 0 }
-        return Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+        AwakeMonitor.activityTs(forCwd: cwd)
     }
 
     // Shared notification poster for both the terminal (hook/marker) and VSCode

@@ -48,10 +48,30 @@ stays awake; the display may still sleep) in two cases:
 
 - **Remote Control** — automatically, while a bridge is connected, so a session
   driven from claude.ai / mobile can't be dropped by idle sleep in the gap
-  between turns when the keep-awake hook isn't holding one.
+  between turns when the keep-awake hook isn't holding one. This hold is capped
+  by the **Remote Idle Timeout** (see below) so an abandoned remote session
+  doesn't keep the Mac awake forever.
 - **Keep awake** — a manual menu toggle to force the Mac awake regardless of
   Claude. It resets to off on each launch, and the menu-bar cup gets a small
   **red badge** while it's on.
+
+### Remote Idle Timeout
+
+A remote session that's been left idle shouldn't keep the Mac awake
+indefinitely. The **Remote Idle Timeout** menu (Off / 30 min / 1 hr / 2 hr,
+default **1 hr**) releases the Remote Control hold once a connected session has
+seen no activity (no prompt, tool use, or turn) for that long — a new turn
+resets the timer. When it fires, the menu shows **Remote control: idle (sleep
+allowed)** and the Mac can sleep normally.
+
+Because the keep-awake hook *also* holds the Mac awake between turns for a
+remote session, this only delivers a true cap end-to-end: AwakeBar publishes the
+chosen window to `/tmp/claude-keep-awake.idle`, and `keep-awake.sh` restarts its
+between-turns `caffeinate` with that as its `-t`, so the hook's own hold expires
+on the same window instead of its 4 h backstop. Set the timeout to **Off** to
+restore the old behavior (held as long as the bridge is connected; hook caps at
+4 h/prompt). The idle signal comes from `notify-attention.sh`'s per-cwd activity
+markers, so that hook must be installed for sub-4 h capping to apply.
 
 Either assertion is filtered out of AwakeBar's own holder list (so it never
 circularly lists itself) and surfaced instead under **Kept awake by:** as
@@ -84,9 +104,12 @@ prebuilt `icon/AppIcon.icns`; re-run `./icon/build-iconset.sh <style>`
 `keep-awake.sh` is the paired Claude Code hook: it runs a `caffeinate` while
 Claude is working and stops when the turn ends — and for a **Remote Control**
 session it keeps the Mac awake *between* turns too, so a session driven from
-claude.ai or mobile isn't killed by the Mac sleeping. Install it by copying
-the script to `~/.claude/` (and `chmod +x` it), then wiring it into
-`~/.claude/settings.json`:
+claude.ai or mobile isn't killed by the Mac sleeping. The between-turns hold is
+bounded: each turn restarts `caffeinate` with `-t` set to the idle window
+AwakeBar publishes at `/tmp/claude-keep-awake.idle` (default 4 h when that file
+is absent), so an idle remote session stops holding once the window passes with
+no new turn. Install it by copying the script to `~/.claude/` (and `chmod +x`
+it), then wiring it into `~/.claude/settings.json`:
 
 ```json
 {

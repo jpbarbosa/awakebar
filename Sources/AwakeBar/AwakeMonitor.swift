@@ -39,6 +39,14 @@ enum AwakeMonitor {
         let resolved: Bool
     }
 
+    // One VSCode window whose Remote Control bridge is connected: a display label
+    // (the cwd basename) and the full cwd, when discoverable, for its activity
+    // marker. cwd is nil when the log's tail carried no usable cwd line.
+    struct RemoteSession: Sendable {
+        let project: String
+        let cwd: String?
+    }
+
     // An immutable view of everything the menu needs, produced by collect().
     struct Snapshot: Sendable {
         var state: State = .canSleep
@@ -50,10 +58,17 @@ enum AwakeMonitor {
         var hookReason: HookReason = .unknown
         var hookInstalled = false
 
-        // Project folders (cwd basenames) of the VSCode windows that currently
-        // have Remote Control connected. Empty means no remote session.
-        var remoteProjects: [String] = []
-        var remoteControlActive: Bool { !remoteProjects.isEmpty }
+        // The VSCode windows that currently have Remote Control connected. Empty
+        // means no remote session. Each carries the project label (cwd basename)
+        // for display and the full cwd for looking up its activity marker.
+        var remoteSessions: [RemoteSession] = []
+        var remoteProjects: [String] { remoteSessions.map(\.project) }
+        var remoteControlActive: Bool { !remoteSessions.isEmpty }
+
+        // The most recent activity (prompt/tool/stop) across the connected remote
+        // sessions, from their per-cwd markers; nil when no marker was found. The
+        // app uses this to release its remote hold once a session goes idle.
+        var remoteLastActivity: Date?
 
         // Attention notifications the VSCode extension surfaced (permission
         // prompts). Its in-panel toasts don't reach the OS and the Notification
@@ -142,7 +157,8 @@ enum AwakeMonitor {
         snap.hookActive = snap.holders.contains { $0.isClaudeHook }
         snap.hookReason = snap.hookActive ? readHookReason() : .unknown
         snap.hookInstalled = FileManager.default.fileExists(atPath: hookScriptPath)
-        snap.remoteProjects = checkRemoteControl()
+        snap.remoteSessions = checkRemoteControl()
+        snap.remoteLastActivity = lastActivity(of: snap.remoteSessions)
         snap.vscodeAttention = collectVSCodeAttention()
         return snap
     }
@@ -200,18 +216,18 @@ enum AwakeMonitor {
     //    drives one session, so cwd is a faithful label.
     //  * Parses undocumented debug strings; the markers are centralised below
     //    so a Claude Code rename is a one-line fix here.
-    private static func checkRemoteControl() -> [String] {
+    private static func checkRemoteControl() -> [RemoteSession] {
         // A crashed session can leave a "connected" log behind; require that at
         // least one Claude session is actually alive before trusting the logs.
         guard hasLiveSession() else { return [] }
-        var projects: [String] = []
+        var sessions: [RemoteSession] = []
         for log in recentVSCodeLogs(within: remoteLogFreshness) {
-            if let project = connectedProject(inTailOf: log),
-               !projects.contains(project) {
-                projects.append(project)
+            if let session = connectedProject(inTailOf: log),
+               !sessions.contains(where: { $0.project == session.project }) {
+                sessions.append(session)
             }
         }
-        return projects
+        return sessions
     }
 
     // MARK: VSCode attention notifications
@@ -341,9 +357,10 @@ enum AwakeMonitor {
     // last lifecycle marker is a connect-class one; if no marker survives in
     // the tail (handshake scrolled off) but bridge traffic is present, that's a
     // connected session past its handshake. The label is the basename of the
-    // most recent cwd in the tail, or a generic name if none survived.
+    // most recent cwd in the tail, or a generic name if none survived; the full
+    // cwd rides along (when found) so the caller can find its activity marker.
     // (internal, not private, so AwakeBarTests can drive it with sample logs.)
-    static func connectedProject(inTailOf path: String) -> String? {
+    static func connectedProject(inTailOf path: String) -> RemoteSession? {
         guard let data = tailData(ofFile: path) else { return nil }
 
         func lastIndex(of marker: String) -> Int? {
@@ -361,7 +378,9 @@ enum AwakeMonitor {
             || data.range(of: Data("[bridge:".utf8)) != nil
         guard connected ?? sawBridgeActivity else { return nil }
 
-        return projectLabel(in: data)
+        let cwd = lastCwd(in: data)
+        let project = cwd.map { ($0 as NSString).lastPathComponent } ?? "Claude session"
+        return RemoteSession(project: project, cwd: cwd)
     }
 
     // The most recent cwd a VSCode-hosted session was launched with, read from
@@ -397,6 +416,44 @@ enum AwakeMonitor {
     // and attention-notification scans.
     static func projectLabel(in data: Data) -> String {
         lastCwd(in: data).map { ($0 as NSString).lastPathComponent } ?? "Claude session"
+    }
+
+    // MARK: Remote idle
+
+    // The most recent activity across the given remote sessions, read from their
+    // per-cwd markers; nil when none has a marker (or none carried a cwd).
+    private static func lastActivity(of sessions: [RemoteSession]) -> Date? {
+        sessions.compactMap { session -> Date? in
+            guard let cwd = session.cwd else { return nil }
+            let ts = activityTs(forCwd: cwd)
+            return ts > 0 ? Date(timeIntervalSince1970: TimeInterval(ts)) : nil
+        }.max()
+    }
+
+    // Last activity epoch for a session cwd, from the per-cwd marker
+    // notify-attention.sh bumps on prompt/tool/stop events; 0 when none exists.
+    // The sanitiser mirrors the hook's `tr -c 'A-Za-z0-9' '_'`.
+    static func activityTs(forCwd cwd: String) -> Int {
+        var safe = ""
+        for ch in cwd { safe.append(ch.isASCII && (ch.isLetter || ch.isNumber) ? ch : "_") }
+        let path = "/tmp/claude-activity-" + safe
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { return 0 }
+        return Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+    }
+
+    // Whether AwakeBar should hold its remote assertion. Releases (false) once a
+    // connected session has been idle past `timeout`, so an idle remote session
+    // lets the Mac sleep. timeout <= 0 disables the cap (hold while connected).
+    // While the keep-awake hook's caffeinate is live (hookActive), or when there
+    // is no activity signal at all, it stays held — never forcing sleep blindly.
+    static func shouldHoldRemote(connected: Bool, timeout: TimeInterval,
+                                 lastActivity: Date?, now: Date,
+                                 hookActive: Bool) -> Bool {
+        guard connected else { return false }
+        guard timeout > 0 else { return true }
+        if hookActive { return true }
+        guard let lastActivity else { return true }
+        return now.timeIntervalSince(lastActivity) < timeout
     }
 
     // How much of a (potentially multi-MB) log to read from the end. 2 MiB is far
