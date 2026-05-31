@@ -336,7 +336,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                                        : "Remote Control: Active",
                                   color: .secondaryLabelColor, status: !idle))
             for project in snap.remoteProjects {
-                menu.addItem(infoItem(project, color: .secondaryLabelColor, indent: 1))
+                // Spacer where the parent has its dot, so each project's name lines
+                // up flush-left with the "Remote Control:" label above it.
+                let row = infoItem(project, color: .secondaryLabelColor)
+                row.image = spacerSlot()
+                menu.addItem(row)
             }
         } else {
             menu.addItem(infoItem("Remote Control: Off", color: .secondaryLabelColor,
@@ -353,8 +357,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             keptAwakeBy.append("AwakeBar (manual)")
         }
         if awake && !keptAwakeBy.isEmpty {
-            // A native section header carries its own grouping rule, so no
-            // separator is needed above it.
+            menu.addItem(.separator())
             menu.addItem(.sectionHeader(title: "Kept awake by"))
             for label in keptAwakeBy {
                 let row = infoItem(label, color: .secondaryLabelColor)
@@ -431,7 +434,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         let quit = NSMenuItem(title: "Quit AwakeBar",
                               action: #selector(quit), keyEquivalent: "q")
         quit.target = self
-        quit.image = spacerSlot()
+        // Power glyph in the shared leading slot — a familiar "turn off" cue.
+        let power = NSImage(systemSymbolName: "power", accessibilityDescription: "Quit")?
+            .withSymbolConfiguration(.init(pointSize: 12, weight: .semibold))
+        quit.image = leadingSlot(power, template: true)
         menu.addItem(quit)
     }
 
