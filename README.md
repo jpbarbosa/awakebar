@@ -3,8 +3,9 @@
 A tiny macOS menu bar app that shows, at a glance, whether something is
 deliberately keeping your Mac awake — with first-class awareness of the
 Claude Code CLI. It can also **notify you when Claude is waiting on you** (a
-permission prompt, or an idle session), so you can step away and get pulled
-back the moment Claude needs a decision.
+permission prompt, or an idle session) and **when a long task finishes**, so you
+can step away and get pulled back the moment Claude needs a decision — or the
+moment the work is done.
 
 ![AwakeBar showing the menu bar dropdown next to a Claude Code session](awakebar.webp)
 
@@ -15,24 +16,45 @@ A coffee cup in the menu bar:
 - **☕ filled** — something is holding a system-sleep assertion
 - **💤 empty** — the Mac can sleep normally
 
-The dropdown lists the responsible processes and always shows a dedicated
-**Claude Code hook** line — `Claude is working` during a turn,
-`holding for a remote session` when a Remote Control session keeps the Mac
-awake between turns, `idle (last active 30s ago)` otherwise — plus a live
-**Remote control** line:
+The dropdown opens with a headline (**Mac is being kept awake** / **Mac can
+sleep normally**) and two live status lines:
+
+- a dedicated **Claude Code Hook** line — `Claude is working` during a turn,
+  `holding for a remote session` between turns of a Remote Control session,
+  `idle (last active 30s ago)` otherwise, or `not installed`;
+- a **Remote Control** line — `Active` (with each connected project listed
+  beneath it), `idle (sleep allowed)` once the idle timeout has released the
+  hold, or `Off`.
+
+When the Mac is awake it also lists exactly what's responsible under **Kept
+awake by**, followed by the controls:
 
 ```
 ☕ Mac is being kept awake
 ──────────────
-Claude Code hook: holding for a remote session
-Remote control: active
+● Claude Code Hook: holding for a remote session
+● Remote Control: Active
+     awakebar
+     maru
 ──────────────
-Kept awake by:
-   caffeinate (Claude Code hook)
+Kept awake by
+     caffeinate (Claude Code Hook)
+     AwakeBar (Remote Control session)
 ──────────────
-Open at Login
-Quit AwakeBar
+   Force Stay Awake
+✓ Notify When Task Finishes
+✓ Clear Notifications When Resumed
+   Notification Delay     ▸
+   Remote Idle Timeout    ▸
+✓ Open at Login
+──────────────
+⏻ Quit AwakeBar
 ```
+
+The controls are **Force Stay Awake** (a manual hold that red-badges the cup),
+**Notify When Task Finishes**, **Clear Notifications When Resumed**,
+**Notification Delay**, **Remote Idle Timeout**, **Open at Login**, and **Quit**
+— each covered below.
 
 State comes from `pmset -g assertions`, so it reflects the *whole system* —
 unlike KeepingYouAwake or Amphetamine, whose icon only tracks their own
@@ -89,6 +111,11 @@ Builds and signs `AwakeBar.app`. For the first install, drag it to
 `/Applications`, open it, and pick **Open at Login** from its menu — it lives
 only in the menu bar, no Dock icon. After that, `./build.sh` keeps the
 installed copy in sync on every rebuild.
+
+The source lives in `Sources/AwakeBar/`, one file per type (`AwakeMonitor`,
+`PowerAssertion`, `AttentionWatcher`, `AppDelegate`, and the `main` entry
+point). `swift test` runs the unit tests covering the `pmset` and VSCode-log
+parsers in `AwakeMonitor`.
 
 The app icon — a coffee cup on a Liquid-Glass-style squircle — is assembled in
 `icon/make-icon.swift`: the tile (squircle, gloss, sheen) is drawn in Core
@@ -154,12 +181,19 @@ the same events):
 On `Notification` the hook drops a marker at `/tmp/claude-attention.json`
 (`project`, `message`, `cwd`, and a `ts` dedup key); AwakeBar watches it with a
 kqueue source — so it reacts instantly, not bound to the 10s poll — and posts the
-notification via `UNUserNotificationCenter`, titled with the project so
-concurrent sessions are distinguishable. Clicking the banner brings VSCode
-forward.
+notification via `UNUserNotificationCenter`, titled `Claude · <project>` so
+concurrent sessions are distinguishable. The body drops the leading "Claude" so
+it doesn't echo that title — *"Claude is requesting permission to use Bash"*
+becomes **Requesting permission to use Bash**, *"Claude is waiting for your
+input"* becomes **Waiting for your input** — and alerts from one session stack
+under a single
+header (a `threadIdentifier` keyed by `cwd`, falling back to the project name for
+the VSCode path) rather than listing every repeat. Clicking the banner brings
+VSCode forward.
 
-The alert is **deferred ~10 seconds**, then dropped if you've engaged with that
-session in the meantime — so it only fires when you've actually stepped away:
+The alert is **deferred** by a grace period (the **Notification Delay** menu —
+5 or 10 s, default 10), then dropped if you've engaged with that session in the
+meantime — so it only fires when you've actually stepped away:
 
 - **Quiet if you're on it** — the other three events (`PostToolUse`,
   `UserPromptSubmit`, `Stop`) bump a per-`cwd` activity marker. If that session's
@@ -170,20 +204,54 @@ session in the meantime — so it only fires when you've actually stepped away:
 - **No replay on launch** — a marker left over from before AwakeBar started is
   recorded as already-seen; only a strictly newer `ts` fires.
 
+When **Clear Notifications When Resumed** is on (the default), a delivered alert
+is automatically withdrawn from Notification Center once that session starts
+running again — so a stale "Claude is waiting" banner doesn't linger after you've
+answered. Turn it off to keep delivered alerts as a record.
+
 **VSCode is the exception.** The `Notification` hook never fires for VSCode's
 *in-panel* permission prompts — it's a terminal-CLI event — so the hook path
 above covers terminal sessions only. For VSCode, AwakeBar instead reads the
 extension's debug log (the same log it uses for Remote Control), which records
 the extension's own `show_notification` intent (*"Claude is requesting permission
 to use …"*) and the resolution (`tool_permission_response`, or the session
-leaving `waiting_input`). The same ~10s grace applies — answer within the window
-and no banner fires. Like the Remote Control detection this parses undocumented
-log strings, centralised in `main.swift` so a Claude Code rename is a one-line fix.
+leaving `waiting_input`). The same grace applies — answer within the window and
+no banner fires. Like the Remote Control detection this parses undocumented log
+strings, centralised in `Sources/AwakeBar/AwakeMonitor.swift` so a Claude Code
+rename is a one-line fix.
 
 The first time it fires, macOS asks you to allow notifications for AwakeBar. To
 turn the feature off, remove the hooks or switch AwakeBar off in **System
 Settings ▸ Notifications**. It works for any session — terminal (via the hook) or
 VSCode (via the log), in any window.
+
+### When a task finishes
+
+The same hook also notifies you when a **task finishes** — gated on how long the
+turn ran, *not* on whether you're at the keyboard, so it fires the instant a real
+task ends whatever window you're in (switch to another VSCode window and you're
+still told the moment it's done). `notify-attention.sh` records the turn's start
+on `UserPromptSubmit` and, on `Stop`, writes a marker at `/tmp/claude-done.json`
+(`project`/`message`/`cwd`/`ts` plus `dur`, the turn's length in seconds)
+alongside the activity bump. AwakeBar watches it on its own kqueue source and
+posts a *"Task finished"* banner when `dur` is at least **30 s** — a real task —
+so quick conversational replies stay quiet (a `dur` of −1, meaning the start
+wasn't recorded, errs toward notifying). It's deferred by the same grace as the
+waiting alerts (the **Notification Delay** menu): resume the session within that
+window — a new prompt bumps the activity marker past the done timestamp — and the
+banner never fires, since you clearly saw it finish. Resume *after* it has posted
+and, when **Clear Notifications When Resumed** is on, the next poll (≤10 s)
+withdraws it. Toggle it with **Notify
+When Task Finishes** in the menu (on by default); it needs no extra wiring beyond
+the `Stop` and `UserPromptSubmit` events already shown above. This works in
+**VSCode too** — the `Stop` hook fires there even though the `Notification` hook
+doesn't, so it fills the gap the in-panel-only permission prompts leave.
+
+Gating on duration rather than presence is deliberate: an idle check (no
+keyboard/mouse) can't tell "stepped away" from "working in another window" — if
+you switched to a second VSCode window to keep working, you're *not* idle, so an
+idle-gated alert would never fire in exactly the case you wanted it. Turn length
+is the signal that actually tracks "this was a task worth announcing."
 
 ### How Remote Control is detected
 
@@ -195,8 +263,8 @@ on-disk trace: the bridge **lifecycle** logged by Claude Code's VSCode
 extension-host log, trusting the last connect/teardown marker. This is
 best-effort — it works for **VSCode-hosted** sessions running with `--debug`
 (the extension's default), and reads as "off" for pure-terminal sessions. The
-marker strings are centralised in both `main.swift` and `keep-awake.sh` so a
-Claude Code rename is a one-line fix.
+marker strings are centralised in both `Sources/AwakeBar/AwakeMonitor.swift` and
+`keep-awake.sh` so a Claude Code rename is a one-line fix.
 
 The app goes one step further and **lists which project** each connected
 session is driving: the same log records the session's `cwd` (in its

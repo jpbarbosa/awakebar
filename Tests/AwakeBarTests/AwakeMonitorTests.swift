@@ -254,3 +254,56 @@ import Foundation
         #expect(AwakeMonitor.activityTs(forCwd: cwd) == 0)
     }
 }
+
+// MARK: - tightenBody
+
+// The notification body comes from Claude Code, which echoes "Claude" (already
+// in the title) and uses wordy stock phrasing. tightenBody strips that down to
+// the part that differs between alerts.
+@Suite struct TightenBodyTests {
+    @Test func keepsPermissionPhrasingMinusClaude() {
+        #expect(AppDelegate.tightenBody("Claude is requesting permission to use Bash")
+            == "Requesting permission to use Bash")
+        #expect(AppDelegate.tightenBody("Claude needs your permission to use AskUserQuestion")
+            == "Needs your permission to use AskUserQuestion")
+    }
+
+    @Test func dropsLeadingClaudeAndCapitalizes() {
+        #expect(AppDelegate.tightenBody(
+            "Claude is waiting for your input") == "Waiting for your input")
+        #expect(AppDelegate.tightenBody("Claude is waiting for you") == "Waiting for you")
+    }
+
+    @Test func leavesUnprefixedBodyUnchanged() {
+        #expect(AppDelegate.tightenBody("Task finished") == "Task finished")
+    }
+
+    @Test func handlesDegenerateInputs() {
+        #expect(AppDelegate.tightenBody("") == "")
+        // No trailing space: matches neither prefix, returned verbatim.
+        #expect(AppDelegate.tightenBody("Claude") == "Claude")
+        // Bare prefix with nothing after it collapses to empty rather than crashing.
+        #expect(AppDelegate.tightenBody("Claude is ") == "")
+    }
+}
+
+// MARK: - isRealTask
+
+// The "was this a real task" gate behind the task-finished notification: a turn
+// at least minTaskDuration (30s) long fires; quick replies stay quiet; an unknown
+// duration (-1, start not recorded) errs toward notifying.
+@Suite struct IsRealTaskTests {
+    @Test func unknownDurationErrsTowardNotifying() {
+        #expect(AwakeMonitor.isRealTask(durationSeconds: -1, minimum: 30))
+    }
+
+    @Test func quickReplyStaysQuiet() {
+        #expect(!AwakeMonitor.isRealTask(durationSeconds: 0, minimum: 30))
+        #expect(!AwakeMonitor.isRealTask(durationSeconds: 29, minimum: 30))
+    }
+
+    @Test func atOrPastThresholdFires() {
+        #expect(AwakeMonitor.isRealTask(durationSeconds: 30, minimum: 30))   // boundary
+        #expect(AwakeMonitor.isRealTask(durationSeconds: 31, minimum: 30))
+    }
+}

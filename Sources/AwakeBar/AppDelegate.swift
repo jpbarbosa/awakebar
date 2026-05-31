@@ -42,12 +42,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private var attentionWatcher: AttentionWatcher?
     private var lastAttentionTs = 0
     private var pendingAlert: DispatchWorkItem?
+    private var pendingDone: DispatchWorkItem?
     // How long a session must stay blocked before we alert — the "Alert delay"
     // submenu lets the user pick from graceChoices. Persisted across launches
     // (loaded in applicationDidFinishLaunching, default 10s).
     private static let graceKey = "attentionGraceSeconds"
     private static let graceChoices: [TimeInterval] = [5, 10]
     private var attentionGrace: TimeInterval = 10
+
+    // "Task finished" notifications. notify-attention.sh writes doneMarkerPath on
+    // every turn end (Stop), stamping how long the turn ran; the watcher fires the
+    // moment it changes. We notify when that duration is at least minTaskDuration —
+    // it was a real task, not a quick reply — so it pings the instant the task ends
+    // whatever window you're in, rather than waiting on you to go idle. A duration
+    // of -1 (start unknown) errs toward notifying. lastDoneTs dedupes (primed
+    // before the watch arms); the menu toggle persists.
+    private let doneMarkerPath = "/tmp/claude-done.json"
+    private var doneWatcher: AttentionWatcher?
+    private var lastDoneTs = 0
+    private static let minTaskDuration: TimeInterval = 30
+    private static let notifyDoneKey = "notifyOnTaskDone"
+    private var notifyOnDone = true
 
     // How long a remote-controlled session may stay idle (no prompt/tool/stop
     // activity) before AwakeBar releases its remote hold and lets the Mac sleep.
@@ -75,6 +90,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     // keyed by project → (id, event time), cleared when that event shows resolved.
     private var deliveredByCwd: [String: (id: String, ts: Int)] = [:]
     private var deliveredVSCode: [String: (id: String, time: Date)] = [:]
+    // Delivered "Task finished" banners, withdrawn the same way as the terminal
+    // waiting alerts: keyed by cwd → (id, done ts), cleared once that cwd's
+    // activity marker passes ts (you sent a new prompt = resumed the session).
+    private var deliveredDoneByCwd: [String: (id: String, ts: Int)] = [:]
     // The "Clear alerts when resumed" menu toggle. On by default; when off we keep
     // tracking delivered alerts but never withdraw them, so flipping it back on
     // resumes clearing for the next session that resumes. Persisted across launches
@@ -88,8 +107,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // stays on.
         UserDefaults.standard.register(defaults: [Self.autoClearKey: true,
                                                   Self.graceKey: 10.0,
-                                                  Self.remoteIdleKey: 3600.0])
+                                                  Self.remoteIdleKey: 3600.0,
+                                                  Self.notifyDoneKey: true])
         autoClearAlerts = UserDefaults.standard.bool(forKey: Self.autoClearKey)
+        notifyOnDone = UserDefaults.standard.bool(forKey: Self.notifyDoneKey)
         let savedGrace = UserDefaults.standard.double(forKey: Self.graceKey)
         attentionGrace = Self.graceChoices.contains(savedGrace) ? savedGrace : 10
         let savedIdle = UserDefaults.standard.double(forKey: Self.remoteIdleKey)
@@ -133,6 +154,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             }
         }
         attentionWatcher?.start()
+
+        // Same kqueue pattern for the "task finished" marker (see handleDone).
+        primeDone()
+        doneWatcher = AttentionWatcher(path: doneMarkerPath) { [weak self] in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.handleDone() }
+            }
+        }
+        doneWatcher?.start()
     }
 
     // Refresh the moment the menu opens. The refresh is async, so the menu
@@ -300,6 +330,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             String(remoteAssertion.held),
             String(manualAssertion.held),
             String(autoClearAlerts),
+            String(notifyOnDone),
             String(attentionGrace),
             String(remoteIdleTimeout),
             snap.remoteProjects.joined(separator: ","),
@@ -375,6 +406,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         keepAwake.toolTip = "Force the Mac awake until turned off, regardless of Claude or Remote Control (the display may still sleep)"
         keepAwake.image = checkmarkSlot(manualKeepAwake)
         menu.addItem(keepAwake)
+
+        // Notify when a task finishes — gated on how long the turn ran (real tasks
+        // ping, quick replies don't), independent of which window you're in.
+        let notifyDone = NSMenuItem(title: "Notify When Task Finishes",
+                                    action: #selector(toggleNotifyOnDone), keyEquivalent: "")
+        notifyDone.target = self
+        notifyDone.toolTip = "Post a notification when a task (a turn longer than ~30s) finishes, whatever window you're in"
+        notifyDone.image = checkmarkSlot(notifyOnDone)
+        menu.addItem(notifyDone)
 
         // Withdraw a delivered "Claude is waiting" alert once that session resumes
         // after you act. On by default; turn off to keep alerts in Notification
@@ -578,6 +618,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         render()
     }
 
+    // Toggle "Notify When Task Finishes" and persist it.
+    @objc private func toggleNotifyOnDone() {
+        notifyOnDone.toggle()
+        UserDefaults.standard.set(notifyOnDone, forKey: Self.notifyDoneKey)
+        render()
+    }
+
     // Pick the alert delay from the submenu. The tag carries the seconds; takes
     // effect on the next event (an already-scheduled alert keeps its old timing).
     @objc private func setGrace(_ sender: NSMenuItem) {
@@ -616,6 +663,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         var message: String?
         var cwd: String?
         var ts: Int
+        var dur: Int?      // turn length in seconds (done marker only); nil/-1 = unknown
     }
 
     private func setUpNotifications() {
@@ -667,16 +715,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         if let cwd = event.cwd { deliveredByCwd[cwd] = (id, event.ts) }
     }
 
+    // MARK: Task-finished notifications
+
+    private func readDoneMarker() -> AttentionEvent? {
+        guard let data = FileManager.default.contents(atPath: doneMarkerPath)
+        else { return nil }
+        return try? JSONDecoder().decode(AttentionEvent.self, from: data)
+    }
+
+    // Record the current done marker's ts without alerting, so a turn that ended
+    // before this launch can't fire a "task finished" alert at startup.
+    private func primeDone() {
+        if let event = readDoneMarker() { lastDoneTs = event.ts }
+    }
+
+    // Called on the main actor whenever the done marker changes (every turn end).
+    // Alerts only if the feature is on, the event is new, and the turn ran at least
+    // minTaskDuration — that "was this a real task" gate replaces any presence
+    // check, so it fires the instant a long task ends whatever window you're in,
+    // while a quick reply stays quiet. A duration of -1 (start unknown) errs toward
+    // notifying. Like the waiting alerts it's withdrawn once you resume the session
+    // (see clearResumedAttentions) when Clear Notifications When Resumed is on.
+    private func handleDone() {
+        guard notifyOnDone,
+              let event = readDoneMarker(), event.ts > lastDoneTs else { return }
+        lastDoneTs = event.ts
+        let dur = event.dur ?? -1
+        guard AwakeMonitor.isRealTask(durationSeconds: dur,
+                                      minimum: Self.minTaskDuration) else { return }
+        // Defer by the same grace as the waiting alerts (the Notification Delay
+        // menu): if you resume the session within the window you saw it finish, so
+        // fireDoneIfStillAway suppresses the banner outright instead of the poll
+        // having to flash-then-withdraw it. A newer turn cancels and reschedules.
+        pendingDone?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.fireDoneIfStillAway(event) }
+        pendingDone = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + attentionGrace, execute: item)
+    }
+
+    // Fired attentionGrace after the turn ended. If you've resumed that session
+    // meanwhile (activity past the event), stay quiet — you watched it finish.
+    // Otherwise post; clearResumedAttentions still withdraws it for a later resume.
+    private func fireDoneIfStillAway(_ event: AttentionEvent) {
+        pendingDone = nil
+        if let cwd = event.cwd, activityTs(forCwd: cwd) > event.ts { return }
+        let id = "claude-done-\(event.ts)"
+        postAttentionNotification(project: event.project, message: "Task finished",
+                                  id: id, cwd: event.cwd)
+        // Track so it auto-withdraws once you resume that session.
+        if let cwd = event.cwd { deliveredDoneByCwd[cwd] = (id, event.ts) }
+    }
+
     // Withdraw an already-delivered terminal-path alert once that session resumes
     // after you acted: the per-cwd activity marker passing the event ts is the
     // same signal fireIfStillWaiting uses to stay quiet before the alert fires,
     // applied here a step later — once polled (≤10s), not the instant it bumps.
     private func clearResumedAttentions() {
-        guard autoClearAlerts, !deliveredByCwd.isEmpty else { return }
+        guard autoClearAlerts else { return }
         let center = UNUserNotificationCenter.current()
         for (cwd, entry) in deliveredByCwd where activityTs(forCwd: cwd) > entry.ts {
             center.removeDeliveredNotifications(withIdentifiers: [entry.id])
             deliveredByCwd[cwd] = nil
+        }
+        // Task-finished banners clear the same way: once you send a new prompt in
+        // that session (activity passes the done timestamp), withdraw the banner.
+        for (cwd, entry) in deliveredDoneByCwd where activityTs(forCwd: cwd) > entry.ts {
+            center.removeDeliveredNotifications(withIdentifiers: [entry.id])
+            deliveredDoneByCwd[cwd] = nil
         }
     }
 
@@ -723,11 +828,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         let content = UNMutableNotificationContent()
         let p = (project?.isEmpty == false) ? project : nil
         content.title = p.map { "Claude · \($0)" } ?? "Claude Code"
-        content.body = (message?.isEmpty == false) ? message! : "Claude is waiting for you"
+        let raw = (message?.isEmpty == false) ? message! : "Claude is waiting for you"
+        content.body = Self.tightenBody(raw)
         content.sound = .default
+        // Stack alerts from the same session under one header in Notification
+        // Center instead of listing every repeat — group by cwd (terminal) and
+        // fall back to the project name (VSCode path has no cwd).
+        content.threadIdentifier = cwd ?? p ?? "claude"
         if let cwd { content.userInfo = ["cwd": cwd] }
         let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
+    }
+
+    // The notification body comes from Claude Code, which prefixes "Claude" — the
+    // title already carries it. Strip that leading "Claude"/"Claude is " so the
+    // body doesn't echo the title ("Claude is requesting permission to use Bash"
+    // -> "Requesting permission to use Bash"), keeping the rest intact.
+    nonisolated static func tightenBody(_ raw: String) -> String {
+        for prefix in ["Claude is ", "Claude "] where raw.hasPrefix(prefix) {
+            let rest = raw.dropFirst(prefix.count)
+            return "\(rest.prefix(1).uppercased())\(rest.dropFirst())"
+        }
+        return raw
     }
 
     private func activateVSCode() {

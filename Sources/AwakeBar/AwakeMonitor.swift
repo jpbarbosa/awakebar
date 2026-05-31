@@ -456,6 +456,14 @@ enum AwakeMonitor {
         return now.timeIntervalSince(lastActivity) < timeout
     }
 
+    // Whether a finished turn is worth a "task finished" notification: a real task
+    // (ran at least `minimum` seconds) rather than a quick conversational reply. A
+    // negative duration means the start wasn't recorded, so it errs toward
+    // notifying rather than swallowing a turn that may well have been long.
+    static func isRealTask(durationSeconds dur: Int, minimum: TimeInterval) -> Bool {
+        dur < 0 || TimeInterval(dur) >= minimum
+    }
+
     // How much of a (potentially multi-MB) log to read from the end. 2 MiB is far
     // more than one session's handshake + recent traffic, and a backwards byte
     // search over it stays fast.
