@@ -94,10 +94,8 @@ enum AwakeMonitor {
     // meaningfully, keeps the Mac awake.)
     private static let ignoredProcesses: Set<String> = ["powerd", "bluetoothd", "sharingd"]
 
-    // keep-awake.sh writes its caffeinate PID here while a Claude turn runs,
-    // and the reason ("turn" / "remote") in the sibling .reason file.
-    private static let hookPidFile = "/tmp/claude-keep-awake.pid"
-    private static let hookReasonFile = "/tmp/claude-keep-awake.reason"
+    // keep-awake.sh writes its caffeinate PID and the reason ("turn"/"remote")
+    // into the marker files defined by the shared hook Contract.
 
     // Absolute path for `rel` resolved under the user's home directory.
     private static func home(_ rel: String) -> String {
@@ -180,19 +178,19 @@ enum AwakeMonitor {
     // (keep-awake.sh removes the file when the turn ends). A stale PID is
     // harmless: it simply won't match any live holder.
     private static func readHookPID() -> Int? {
-        guard let raw = try? String(contentsOfFile: hookPidFile, encoding: .utf8)
+        guard let raw = try? String(contentsOfFile: Contract.hookPidFile, encoding: .utf8)
         else { return nil }
         return Int(raw.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     // Why the hook is holding the Mac awake, per its sibling .reason file.
     private static func readHookReason() -> HookReason {
-        guard let raw = try? String(contentsOfFile: hookReasonFile, encoding: .utf8)
+        guard let raw = try? String(contentsOfFile: Contract.hookReasonFile, encoding: .utf8)
         else { return .unknown }
         switch raw.trimmingCharacters(in: .whitespacesAndNewlines) {
-        case "turn":   return .turn
-        case "remote": return .remote
-        default:       return .unknown
+        case Contract.reasonTurn:   return .turn
+        case Contract.reasonRemote: return .remote
+        default:                    return .unknown
         }
     }
 
@@ -318,17 +316,8 @@ enum AwakeMonitor {
     // the window is generous; the live-session gate above guards the rest.
     private static let remoteLogFreshness: TimeInterval = 30 * 60
 
-    // Bridge lifecycle markers logged by Claude Code's VSCode extension.
-    private static let bridgeConnectMarkers = [
-        "[bridge:sdk] State change: connected",
-        "[bridge:sdk] State change: ready",
-        "[remote-bridge] v2 transport connected",
-        "[remote-bridge] Created session",
-    ]
-    private static let bridgeTeardownMarkers = [
-        "[remote-bridge] Torn down",
-        "[remote-bridge] Archive session",
-    ]
+    // Bridge lifecycle markers live in the shared hook Contract (mirrored by
+    // claude-hook-contract.sh), so a Claude Code rename is a one-line fix there.
 
     // Claude Code VSCode extension-host logs modified within `seconds`.
     private static func recentVSCodeLogs(within seconds: TimeInterval) -> [String] {
@@ -366,16 +355,16 @@ enum AwakeMonitor {
         func lastIndex(of marker: String) -> Int? {
             data.range(of: Data(marker.utf8), options: .backwards)?.lowerBound
         }
-        let lastConnect = bridgeConnectMarkers.compactMap { lastIndex(of: $0) }.max()
-        let lastTeardown = bridgeTeardownMarkers.compactMap { lastIndex(of: $0) }.max()
+        let lastConnect = Contract.bridgeConnectMarkers.compactMap { lastIndex(of: $0) }.max()
+        let lastTeardown = Contract.bridgeTeardownMarkers.compactMap { lastIndex(of: $0) }.max()
         let connected: Bool?
         if let c = lastConnect, let t = lastTeardown { connected = c > t }
         else if lastConnect != nil { connected = true }
         else if lastTeardown != nil { connected = false }
         else { connected = nil }
 
-        let sawBridgeActivity = data.range(of: Data("[remote-bridge]".utf8)) != nil
-            || data.range(of: Data("[bridge:".utf8)) != nil
+        let sawBridgeActivity = Contract.bridgeTrafficPrefixes
+            .contains { data.range(of: Data($0.utf8)) != nil }
         guard connected ?? sawBridgeActivity else { return nil }
 
         let cwd = lastCwd(in: data)
@@ -432,11 +421,9 @@ enum AwakeMonitor {
 
     // Last activity epoch for a session cwd, from the per-cwd marker
     // notify-attention.sh bumps on prompt/tool/stop events; 0 when none exists.
-    // The sanitiser mirrors the hook's `tr -c 'A-Za-z0-9' '_'`.
+    // The marker path (and its cwd sanitiser) come from the shared Contract.
     static func activityTs(forCwd cwd: String) -> Int {
-        var safe = ""
-        for ch in cwd { safe.append(ch.isASCII && (ch.isLetter || ch.isNumber) ? ch : "_") }
-        let path = "/tmp/claude-activity-" + safe
+        let path = Contract.activityMarkerPath(forCwd: cwd)
         guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { return 0 }
         return Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
     }

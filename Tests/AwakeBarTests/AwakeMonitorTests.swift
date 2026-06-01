@@ -262,28 +262,28 @@ import Foundation
 // the part that differs between alerts.
 @Suite struct TightenBodyTests {
     @Test func keepsPermissionPhrasingMinusClaude() {
-        #expect(AppDelegate.tightenBody("Claude is requesting permission to use Bash")
+        #expect(NotificationCoordinator.tightenBody("Claude is requesting permission to use Bash")
             == "Requesting permission to use Bash")
-        #expect(AppDelegate.tightenBody("Claude needs your permission to use AskUserQuestion")
+        #expect(NotificationCoordinator.tightenBody("Claude needs your permission to use AskUserQuestion")
             == "Needs your permission to use AskUserQuestion")
     }
 
     @Test func dropsLeadingClaudeAndCapitalizes() {
-        #expect(AppDelegate.tightenBody(
+        #expect(NotificationCoordinator.tightenBody(
             "Claude is waiting for your input") == "Waiting for your input")
-        #expect(AppDelegate.tightenBody("Claude is waiting for you") == "Waiting for you")
+        #expect(NotificationCoordinator.tightenBody("Claude is waiting for you") == "Waiting for you")
     }
 
     @Test func leavesUnprefixedBodyUnchanged() {
-        #expect(AppDelegate.tightenBody("Task finished") == "Task finished")
+        #expect(NotificationCoordinator.tightenBody("Task finished") == "Task finished")
     }
 
     @Test func handlesDegenerateInputs() {
-        #expect(AppDelegate.tightenBody("") == "")
+        #expect(NotificationCoordinator.tightenBody("") == "")
         // No trailing space: matches neither prefix, returned verbatim.
-        #expect(AppDelegate.tightenBody("Claude") == "Claude")
+        #expect(NotificationCoordinator.tightenBody("Claude") == "Claude")
         // Bare prefix with nothing after it collapses to empty rather than crashing.
-        #expect(AppDelegate.tightenBody("Claude is ") == "")
+        #expect(NotificationCoordinator.tightenBody("Claude is ") == "")
     }
 }
 

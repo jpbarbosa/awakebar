@@ -31,52 +31,53 @@
 #
 # Reads the hook payload as JSON on stdin.
 
+# Shared paths/markers/reason tokens (the mirror of Contract.swift). Lives beside
+# this script — copy claude-hook-contract.sh to ~/.claude/ alongside the hooks.
+. "$(cd "$(dirname "$0")" && pwd)/claude-hook-contract.sh" 2>/dev/null || {
+  echo "keep-awake.sh: cannot source claude-hook-contract.sh — copy it beside the hooks in ~/.claude/" >&2
+  exit 0
+}
+
 input=$(cat 2>/dev/null)
 
-event=""
-if command -v jq >/dev/null 2>&1; then
-  event=$(printf '%s' "$input" | jq -r '.hook_event_name // empty' 2>/dev/null)
-fi
-if [ -z "$event" ]; then
-  event=$(printf '%s' "$input" | tr -d '\n' \
-    | sed -n 's/.*"hook_event_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-fi
+# field() (the jq/sed payload reader) comes from the sourced contract.
+event=$(field hook_event_name)
 
-pidfile="${CLAUDE_KEEP_AWAKE_PIDFILE:-/tmp/claude-keep-awake.pid}"
-reasonfile="${pidfile%.pid}.reason"
-idlefile="${pidfile%.pid}.idle"
+# Paths come from the sourced contract: CLAUDE_PIDFILE / CLAUDE_REASONFILE /
+# CLAUDE_IDLEFILE (the reason/idle files derive from a CLAUDE_KEEP_AWAKE_PIDFILE
+# override the same way they used to).
 
 # Seconds to hold a remote session between turns, written by AwakeBar's "Remote
-# Idle Timeout" setting. Absent or non-numeric falls back to the 4h turn cap, so
+# Idle Timeout" setting. Absent or non-numeric falls back to the default cap, so
 # the hook behaves exactly as before when AwakeBar isn't managing the window.
 remote_idle_seconds() {
   local v
-  v=$(cat "$idlefile" 2>/dev/null)
+  v=$(cat "$CLAUDE_IDLEFILE" 2>/dev/null)
   case "$v" in
-    ''|*[!0-9]*) printf '14400' ;;
+    ''|*[!0-9]*) printf '%s' "$CLAUDE_DEFAULT_CAP" ;;
     *)           printf '%s' "$v" ;;
   esac
 }
 
 kill_tracked() {
-  if [ -f "$pidfile" ]; then
-    kill "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null
-    rm -f "$pidfile"
+  if [ -f "$CLAUDE_PIDFILE" ]; then
+    kill "$(cat "$CLAUDE_PIDFILE" 2>/dev/null)" 2>/dev/null
+    rm -f "$CLAUDE_PIDFILE"
   fi
-  rm -f "$reasonfile"
+  rm -f "$CLAUDE_REASONFILE"
 }
 
 # start <reason> [seconds] — (re)start caffeinate and record why the Mac is held
-# awake. The optional cap defaults to 4h: long enough that a single turn never
-# trips it, and a backstop so a missed Stop can never leak indefinitely.
+# awake. The optional cap defaults to the contract's 4h backstop: long enough that
+# a single turn never trips it, so a missed Stop can never leak indefinitely.
 start() {
   kill_tracked
-  local cap="${2:-14400}"
+  local cap="${2:-$CLAUDE_DEFAULT_CAP}"
   # -i no idle sleep, -m no disk sleep, -s no system sleep (AC only).
   nohup caffeinate -i -m -s -t "$cap" >/dev/null 2>&1 &
-  echo $! > "$pidfile"
+  echo $! > "$CLAUDE_PIDFILE"
   disown 2>/dev/null || true
-  printf '%s' "$1" > "$reasonfile"
+  printf '%s' "$1" > "$CLAUDE_REASONFILE"
 }
 
 # True when a VSCode-hosted session has Remote Control connected. Claude Code
@@ -89,9 +90,8 @@ remote_control_active() {
   [ -d "$root" ] || return 1
   local log last
   while IFS= read -r log; do
-    last=$(tail -c 2097152 "$log" 2>/dev/null | grep -oE \
-      '\[bridge:sdk\] State change: (connected|ready)|\[remote-bridge\] (v2 transport connected|Created session|Torn down|Archive session)' \
-      | tail -1)
+    last=$(tail -c 2097152 "$log" 2>/dev/null \
+      | grep -oE "$CLAUDE_BRIDGE_MARKERS_RE" | tail -1)
     case "$last" in
       *"Torn down"*|*"Archive session"*) ;;    # last marker = disconnected
       ?*) return 0 ;;                           # last marker = connect-class
@@ -109,12 +109,12 @@ case "$event" in
     # starts; poll briefly so a remote session is held from the start.
     # Wired async in settings.json, so this never delays session startup.
     for _ in $(seq 1 15); do
-      if remote_control_active; then start remote "$(remote_idle_seconds)"; break; fi
+      if remote_control_active; then start "$CLAUDE_REASON_REMOTE" "$(remote_idle_seconds)"; break; fi
       sleep 1
     done
     ;;
   UserPromptSubmit)
-    start turn
+    start "$CLAUDE_REASON_TURN"
     ;;
   Stop)
     if remote_control_active; then
@@ -122,7 +122,7 @@ case "$event" in
       # restarting caffeinate with the idle window as its -t. Each turn refreshes
       # this; once a window passes with no new turn, caffeinate exits on its own
       # and the idle remote session stops holding the Mac awake.
-      start remote "$(remote_idle_seconds)"
+      start "$CLAUDE_REASON_REMOTE" "$(remote_idle_seconds)"
     else
       kill_tracked
     fi

@@ -21,33 +21,30 @@
 # you approved a prompt, typed, or the turn ended within the window. Keying the
 # activity by cwd keeps one busy session from silencing another session's alert.
 #
-# Files: attention = ${CLAUDE_ATTENTION_FILE:-/tmp/claude-attention.json},
-#   done = ${CLAUDE_DONE_FILE:-/tmp/claude-done.json} (both { project, message,
-#   cwd, ts, dur } — dur is the turn's length in seconds, or -1 when unknown);
-#   activity = /tmp/claude-activity-<sanitised cwd> (<epoch>); turn start =
-#   /tmp/claude-turnstart-<sanitised cwd> (<epoch>). Reads the hook payload as
+# Files (all defined in the shared contract): attention = CLAUDE_ATTENTION_MARKER,
+#   done = CLAUDE_DONE_MARKER (both { project, message, cwd, ts, dur } — dur is the
+#   turn's length in seconds, or -1 when unknown); activity =
+#   CLAUDE_ACTIVITY_PREFIX<sanitised cwd> (<epoch>); turn start =
+#   CLAUDE_TURNSTART_PREFIX<sanitised cwd> (<epoch>). Reads the hook payload as
 #   JSON on stdin.
+
+# Shared paths/markers/sanitiser (the mirror of Contract.swift). Lives beside this
+# script — copy claude-hook-contract.sh to ~/.claude/ alongside the hooks.
+. "$(cd "$(dirname "$0")" && pwd)/claude-hook-contract.sh" 2>/dev/null || {
+  echo "notify-attention.sh: cannot source claude-hook-contract.sh — copy it beside the hooks in ~/.claude/" >&2
+  exit 0
+}
 
 input=$(cat 2>/dev/null)
 
-# Pull a string field from the payload: jq if available, else a sed fallback.
-field() {
-  local v=""
-  if command -v jq >/dev/null 2>&1; then
-    v=$(printf '%s' "$input" | jq -r --arg k "$1" '.[$k] // empty' 2>/dev/null)
-  fi
-  if [ -z "$v" ]; then
-    v=$(printf '%s' "$input" | tr -d '\n' \
-      | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p")
-  fi
-  printf '%s' "$v"
-}
+# field() (the jq/sed payload reader) comes from the sourced contract.
 
 # Minimal JSON string escaping for the printf fallback below.
 esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 
-# Sanitised cwd (non-alphanumeric -> _), mirroring AwakeBar's marker key.
-safe_cwd() { printf '%s' "$(field cwd)" | tr -c 'A-Za-z0-9' '_'; }
+# Sanitised cwd (non-alphanumeric -> _) via the contract's shared sanitiser, so
+# the marker key matches AwakeBar's exactly.
+safe_cwd() { claude_marker_key "$(field cwd)"; }
 
 # Write { project, message, cwd, ts, dur } to $1 with message $2 and duration $3
 # (seconds, default -1 = unknown). jq builds it when present so any characters in
@@ -71,7 +68,7 @@ write_marker() {
 
 # Bump the per-cwd activity marker — the engagement signal AwakeBar uses to drop
 # an attention alert you've already acted on.
-bump_activity() { printf '%s' "$ts" > "/tmp/claude-activity-$(safe_cwd)"; }
+bump_activity() { printf '%s' "$ts" > "${CLAUDE_ACTIVITY_PREFIX}$(safe_cwd)"; }
 
 event=$(field hook_event_name)
 ts=$(date +%s)
@@ -81,7 +78,7 @@ case "$event" in
   UserPromptSubmit)
     # A turn started: engagement signal + record when, so Stop can time the turn.
     bump_activity
-    printf '%s' "$ts" > "/tmp/claude-turnstart-$(safe_cwd)"
+    printf '%s' "$ts" > "${CLAUDE_TURNSTART_PREFIX}$(safe_cwd)"
     exit 0 ;;
   Stop)
     # End of a turn. Bump activity, then publish the task-finished marker with how
@@ -89,15 +86,15 @@ case "$event" in
     # a long task pings the instant it ends (whatever window you're in) and a quick
     # reply stays quiet. dur = -1 when the start wasn't recorded.
     safe=$(safe_cwd)
-    printf '%s' "$ts" > "/tmp/claude-activity-$safe"
-    startfile="/tmp/claude-turnstart-$safe"
+    printf '%s' "$ts" > "${CLAUDE_ACTIVITY_PREFIX}$safe"
+    startfile="${CLAUDE_TURNSTART_PREFIX}$safe"
     dur=-1
     if [ -r "$startfile" ]; then
       start=$(tr -dc '0-9' < "$startfile" 2>/dev/null)
       [ -n "$start" ] && dur=$(( ts - start ))
       rm -f "$startfile"
     fi
-    write_marker "${CLAUDE_DONE_FILE:-/tmp/claude-done.json}" "Task finished" "$dur"
+    write_marker "$CLAUDE_DONE_MARKER" "Task finished" "$dur"
     exit 0 ;;
   PostToolUse|SubagentStop)
     bump_activity
@@ -108,5 +105,5 @@ esac
 # --- Notification: write the attention marker -------------------------------
 message=$(field message)
 [ -n "$message" ] || message="Claude is waiting for you"
-write_marker "${CLAUDE_ATTENTION_FILE:-/tmp/claude-attention.json}" "$message"
+write_marker "$CLAUDE_ATTENTION_MARKER" "$message"
 exit 0
