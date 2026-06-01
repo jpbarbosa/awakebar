@@ -32,6 +32,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // logic lives here, lifted out of this controller.
     private let notifications = NotificationCoordinator()
 
+    // Optional "Plan usage" panel — the /usage limits, fetched from Claude Code's
+    // OAuth token. Off by default; owns its own throttle/cooldown so the menu code
+    // stays unaware of the network underneath.
+    private let planLimits = PlanLimitsCoordinator()
+
     // How long a remote-controlled session may stay idle (no prompt/tool/stop
     // activity) before AwakeBar releases its remote hold and lets the Mac sleep.
     // The "Remote Idle Timeout" submenu picks from remoteIdleChoices; 0 = Off
@@ -81,12 +86,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // notifications. The coordinator primes its dedup cursors first, so
         // launching AwakeBar never replays a stale alert.
         notifications.start()
+
+        // Repaint when an async plan-usage fetch lands; then kick an initial
+        // fetch (a no-op while the feature is off / not yet due).
+        planLimits.onUpdate = { [weak self] in self?.render() }
+        planLimits.refreshIfDue()
     }
 
     // Refresh the moment the menu opens. The refresh is async, so the menu
     // appears instantly with the last poll's data (≤10s old) and updates in
     // place a moment later if anything changed.
-    func menuWillOpen(_ menu: NSMenu) { refresh() }
+    func menuWillOpen(_ menu: NSMenu) {
+        refresh()
+        planLimits.refreshIfDue()
+    }
 
     // Kick off a background collection; coalesce so overlapping triggers (the
     // 5s timer and a menu open) don't pile up.
@@ -113,6 +126,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // driven by the menu toggle). Then reflect everything in the icon/menu.
         remoteAssertion.set(shouldHoldRemote(snapshot))
         notifications.processSnapshot(snapshot)
+        planLimits.refreshIfDue()   // throttled internally; usually a no-op
         render()
     }
 
@@ -251,6 +265,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             String(notifications.attentionGrace),
             String(remoteIdleTimeout),
             snap.remoteProjects.joined(separator: ","),
+            planLimits.menuSignature,
+            planWarnFingerprint(),
             holders,
         ].joined(separator: "~")
     }
@@ -295,24 +311,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                   status: false))
         }
 
+        // What's actually holding the Mac awake — the process/assertion breakdown.
+        // The hook/remote lines above already give the human "why", so for the
+        // common Claude case this is just underlying detail; it also surfaces any
+        // non-Claude holder (manual hold, audio, a download). Either way it's
+        // secondary, so it lives in a submenu off the status group.
         var keptAwakeBy = snap.holders.map {
             $0.isClaudeHook ? "\($0.name) (Claude Code Hook)" : $0.name
         }
-        if remoteAssertion.held {
-            keptAwakeBy.append("AwakeBar (Remote Control session)")
-        }
-        if manualAssertion.held {
-            keptAwakeBy.append("AwakeBar (manual)")
-        }
+        if remoteAssertion.held { keptAwakeBy.append("AwakeBar (Remote Control session)") }
+        if manualAssertion.held { keptAwakeBy.append("AwakeBar (manual)") }
         if awake && !keptAwakeBy.isEmpty {
-            menu.addItem(.separator())
-            menu.addItem(.sectionHeader(title: "Kept awake by"))
-            for label in keptAwakeBy {
-                let row = infoItem(label, color: .secondaryLabelColor)
-                row.image = spacerSlot()   // align with the other rows' text column
-                menu.addItem(row)
-            }
+            let parent = infoItem("Kept Awake By", color: .secondaryLabelColor)
+            parent.image = spacerSlot()   // align with the dotted status rows' text
+            let sub = NSMenu()
+            sub.autoenablesItems = false
+            for label in keptAwakeBy { sub.addItem(infoItem(label, color: .secondaryLabelColor)) }
+            parent.submenu = sub
+            menu.addItem(parent)
         }
+
+        addPlanUsage(to: menu)
 
         menu.addItem(.separator())
 
@@ -349,6 +368,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                              (label: $0.label, tag: Int($0.seconds)) },
                          selected: Int(remoteIdleTimeout),
                          toolTip: "Let the Mac sleep after this long with no activity on a remote-controlled session (a turn resets the timer). Off keeps it awake as long as the bridge is connected.")
+
+        // Surface the Claude Code plan limits (the /usage screen). Off by default;
+        // turning it on reads the OAuth token from the Keychain (one-time prompt).
+        addToggle(to: menu, title: "Show Plan Usage", action: #selector(togglePlanUsage),
+                  on: planLimits.enabled,
+                  toolTip: "Show your Claude Code 5-hour and weekly plan-limit usage, read from your Claude Code login")
 
         addToggle(to: menu, title: "Open at Login", action: #selector(toggleLogin),
                   on: SMAppService.mainApp.status == .enabled)
@@ -503,6 +528,212 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if s < 60 { return "\(s)s ago" }
         if s < 3600 { return "\(s / 60)m ago" }
         return "\(s / 3600)h ago"
+    }
+
+    // MARK: Plan usage rows
+
+    // Weekly resets show an absolute "Sat 7:00 AM" — or "Sat 19:00" when the Mac is
+    // set to 24-hour time. timeStyle .short follows the system clock preference and
+    // locale; the weekday is templated so its abbreviation follows the locale too.
+    // (The 5-hour reset uses a relative countdown instead — see addPlanPieRows.)
+    private static let resetWeekdayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = .autoupdatingCurrent
+        f.setLocalizedDateFormatFromTemplate("EEE")
+        return f
+    }()
+    private static let resetClockFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = .autoupdatingCurrent
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f
+    }()
+    private static func resetWhen(_ date: Date) -> String {
+        "\(resetWeekdayFormatter.string(from: date)) \(resetClockFormatter.string(from: date))"
+    }
+
+    // Render the plan-usage section per the coordinator's state. Off shows
+    // nothing (the "Show Plan Usage" toggle is the entry point); a ready state
+    // shows one row per present limit, mirroring the /usage screen.
+    private func addPlanUsage(to menu: NSMenu) {
+        guard planLimits.status != .off else { return }
+        menu.addItem(.separator())
+        let tabX = planResetColumnX()   // shared reset column for the header + rows
+        menu.addItem(planHeaderItem(tabX: tabX))   // clickable: opens claude.ai
+        switch planLimits.status {
+        case .ready:
+            if let u = planLimits.usage, !u.isEmpty { addPlanPieRows(to: menu, usage: u, tabX: tabX) }
+            else { menu.addItem(planInfoRow("Unavailable")) }
+        case .loading:      menu.addItem(planInfoRow("Loading…"))
+        case .noToken:      menu.addItem(planInfoRow("Sign in to Claude Code first"))
+        case .unauthorized: menu.addItem(planInfoRow("Reauthorizing…"))
+        case .rateLimited:  menu.addItem(planInfoRow("Rate-limited — will retry later"))
+        case .error:        menu.addItem(planInfoRow("Unavailable"))
+        case .off:          break   // guarded above
+        }
+    }
+
+    // The "Plan Usage" header — the plan name when known (e.g. "Max (5x) Plan
+    // Usage"), a leading external-link cue, and the "Resets" column header right-
+    // aligned over the values below. A standard clickable item, so it gets the
+    // native hover highlight and opens claude.ai on click.
+    private func planHeaderItem(tabX: CGFloat) -> NSMenuItem {
+        let title = planLimits.planLabel.map { "\($0) Plan Usage" } ?? "Plan Usage"
+        // Show the "Resets" column header only when a reset value sits below it.
+        let hasReset = planLimits.usage.map { u in
+            [u.fiveHour, u.sevenDay, u.sevenDayOpus, u.sevenDaySonnet].contains { $0?.resetsAt != nil }
+        } ?? false
+        let item = NSMenuItem(title: title, action: #selector(openPlanUsageWeb), keyEquivalent: "")
+        item.target = self
+        item.attributedTitle = planAttributed(left: title, right: hasReset ? "Resets" : "", tabX: tabX)
+        let arrow = NSImage(systemSymbolName: "arrow.up.right",
+                            accessibilityDescription: "Open on the web")?
+            .withSymbolConfiguration(.init(pointSize: 10, weight: .semibold))
+        item.image = leadingSlot(arrow, template: true)
+        item.toolTip = "Open your plan usage on claude.ai"
+        return item
+    }
+
+    @objc private func openPlanUsageWeb() {
+        NSWorkspace.shared.open(UsageAPI.webUsageURL)
+    }
+
+    // One plan-usage row, aligned to the shared text column like the project rows.
+    private func planInfoRow(_ text: String) -> NSMenuItem {
+        let row = infoItem(text, color: .secondaryLabelColor)
+        row.image = spacerSlot()
+        return row
+    }
+
+    // Past this fraction a limit's pie turns to the warning colour — "you're
+    // getting close" rather than a hard stop.
+    private static let planWarnThreshold = 0.75
+
+    // The ready state: one standard row per present limit — a pie via item.image
+    // (auto-aligned with the other rows' icons, no manual measuring) and
+    // "label: pct" with the reset right-aligned to the shared tab column.
+    private func addPlanPieRows(to menu: NSMenu, usage u: PlanLimits.Usage, tabX: CGFloat) {
+        let now = Date()
+        func add(_ label: String, _ w: PlanLimits.Window?, relative: Bool) {
+            guard let w else { return }
+            let pct = Int(w.utilization.rounded())
+            let reset = w.resetsAt.map {
+                relative ? PlanLimits.countdown(to: $0, now: now)   // "in 3h 10m"
+                         : Self.resetWhen($0)                        // "Sat 07:00"
+            } ?? ""
+            let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+            item.attributedTitle = planAttributed(left: "\(label): \(pct)%", right: reset, tabX: tabX)
+            item.image = leadingSlot(planPie(fraction: w.utilization / 100,
+                                             warn: w.utilization > Self.planWarnThreshold * 100),
+                                     template: false)
+            menu.addItem(item)
+        }
+        add("Session", u.fiveHour, relative: true)
+        add("Weekly", u.sevenDay, relative: false)
+        add("Weekly · Opus", u.sevenDayOpus, relative: false)
+        add("Weekly · Sonnet", u.sevenDaySonnet, relative: false)
+    }
+
+    // "label: pct" with `right` right-aligned to a tab stop at tabX (or just the
+    // left text when there's no value). The tab is the only thing keeping the
+    // reset in a column — the icon/label alignment comes from the standard item.
+    private func planAttributed(left: String, right: String, tabX: CGFloat) -> NSAttributedString {
+        var attrs: [NSAttributedString.Key: Any] =
+            [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: NSColor.secondaryLabelColor]
+        guard !right.isEmpty else { return NSAttributedString(string: left, attributes: attrs) }
+        let para = NSMutableParagraphStyle()
+        para.tabStops = [NSTextTab(textAlignment: .right, location: tabX)]
+        attrs[.paragraphStyle] = para
+        return NSAttributedString(string: "\(left)\t\(right)", attributes: attrs)
+    }
+
+    // The x (in title coordinates) where the reset column right-aligns: the menu's
+    // widest row, but never less than a plan row needs, so the resets sit at the
+    // right edge of the content without colliding with their own label.
+    private func planResetColumnX() -> CGFloat {
+        let font = NSFont.menuFont(ofSize: 0)
+        func w(_ s: String) -> CGFloat { ceil((s as NSString).size(withAttributes: [.font: font]).width) }
+        var planNeed = w("Resets")
+        if let u = planLimits.usage {
+            let now = Date()
+            func consider(_ label: String, _ win: PlanLimits.Window?, relative: Bool) {
+                guard let win, let reset = win.resetsAt else { return }
+                let pct = Int(win.utilization.rounded())
+                let text = relative ? PlanLimits.countdown(to: reset, now: now) : Self.resetWhen(reset)
+                planNeed = max(planNeed, w("\(label): \(pct)%") + 24 + w(text))
+            }
+            consider("Session", u.fiveHour, relative: true)
+            consider("Weekly", u.sevenDay, relative: false)
+            consider("Weekly · Opus", u.sevenDayOpus, relative: false)
+            consider("Weekly · Sonnet", u.sevenDaySonnet, relative: false)
+        }
+        return ceil(max(widestMenuText(), planNeed))
+    }
+
+    // A small pie for the leading slot: an outlined ring with the consumed slice
+    // filled clockwise from 12 o'clock; accent normally, red past the threshold.
+    private func planPie(fraction: Double, warn: Bool) -> NSImage {
+        let diameter: CGFloat = 12
+        let lineWidth: CGFloat = 1
+        let image = NSImage(size: NSSize(width: diameter, height: diameter))
+        image.lockFocus()
+        let center = NSPoint(x: diameter / 2, y: diameter / 2)
+        let radius = diameter / 2 - lineWidth
+        let f = max(0, min(1, CGFloat(fraction)))
+        if f > 0 {
+            (warn ? NSColor.systemRed : .controlAccentColor).setFill()
+            let wedge = NSBezierPath()
+            wedge.move(to: center)
+            wedge.appendArc(withCenter: center, radius: radius,
+                            startAngle: 90, endAngle: 90 - f * 360, clockwise: true)
+            wedge.close()
+            wedge.fill()
+        }
+        let ring = NSBezierPath(ovalIn: NSRect(x: center.x - radius, y: center.y - radius,
+                                               width: radius * 2, height: radius * 2))
+        ring.lineWidth = lineWidth
+        NSColor.secondaryLabelColor.setStroke()
+        ring.stroke()
+        image.unlockFocus()
+        image.isTemplate = false
+        return image
+    }
+
+    // The widest plain-text row in the menu — used to right-align the reset column
+    // to the menu's right edge. Measures the live status text plus the fixed
+    // control titles (the hook "idle (last active …)" line is usually the widest).
+    private func widestMenuText() -> CGFloat {
+        let font = NSFont.menuFont(ofSize: 0)
+        func w(_ s: String) -> CGFloat { ceil((s as NSString).size(withAttributes: [.font: font]).width) }
+        var strings = [
+            "Mac is being kept awake",
+            claudeHookStatusText(),
+            snap.remoteControlActive ? "Remote Control: Active" : "Remote Control: Off",
+            "Kept Awake By",
+            planLimits.planLabel.map { "\($0) Plan Usage" } ?? "Plan Usage",
+            "Force Stay Awake", "Notify When Task Finishes",
+            "Clear Notifications When Resumed", "Notification Delay",
+            "Remote Idle Timeout", "Show Plan Usage", "Open at Login", "Quit AwakeBar",
+        ]
+        strings.append(contentsOf: snap.remoteProjects)
+        return strings.map(w).max() ?? 0
+    }
+
+    // Which limits are over the warning threshold — folded into the menu signature
+    // so a pie's colour flip rebuilds the menu even when the rounded percent (which
+    // is all planLimits.menuSignature carries) hasn't changed.
+    private func planWarnFingerprint() -> String {
+        guard let u = planLimits.usage else { return "" }
+        func warn(_ w: PlanLimits.Window?) -> String {
+            (w.map { $0.utilization > Self.planWarnThreshold * 100 } ?? false) ? "!" : "."
+        }
+        return warn(u.fiveHour) + warn(u.sevenDay) + warn(u.sevenDayOpus) + warn(u.sevenDaySonnet)
+    }
+
+    @objc private func togglePlanUsage() {
+        planLimits.setEnabled(!planLimits.enabled)
+        render()
     }
 
     @objc private func toggleLogin() {

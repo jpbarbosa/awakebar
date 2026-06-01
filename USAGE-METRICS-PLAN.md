@@ -1,7 +1,16 @@
 # AwakeBar — Usage Metrics Plan
 
-**Status:** Proposed · **Created:** 2026-06-01 · **Target window:** week of Jun 1–7, 2026
+**Status:** Panel 2 implemented (behind a flag) · Panel 1 deferred · **Created:** 2026-06-01
 **Owner:** JP · **Scope:** add usage metrics to the menu bar in two independent panels.
+
+> **Decision (2026-06-01):** build **Panel 2** first (the actionable plan-limit
+> number on a Max subscription) and leave **Panel 1** for a later opportunity.
+> Panel 2 shipped as `PlanLimits.swift` + `PlanLimitsCoordinator.swift` +
+> `UsageAPI` in `Contract.swift`, with a "Show Plan Usage" toggle (off by
+> default) and `PlanLimitsTests.swift`. Remaining: verify against the live
+> `/usage` screen once, and confirm the exact per-model bucket keys / the
+> Keychain blob shape on the first real response (the decoder is written to be
+> lenient about both until then).
 
 Background research is captured inline so this doc stands alone. See also
 [CLAUDE.md](CLAUDE.md), [DESIGN.md](DESIGN.md).

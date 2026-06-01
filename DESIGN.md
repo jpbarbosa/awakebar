@@ -168,3 +168,40 @@ commands you run), which can mention `cwd:` and must not be mistaken for the
 real one. Granularity is per-window/per-project, not per-pid (one window
 normally drives one session); if the launch line has scrolled out of the log
 tail the entry falls back to a generic "Claude session".
+
+## Plan usage (the optional `/usage` panel)
+
+**Show Plan Usage** mirrors Claude Code's `/usage` limits in the menu. The
+numbers come from the same read-only endpoint `/usage` itself uses —
+`GET https://api.anthropic.com/api/oauth/usage` — which returns the plan's usage
+windows (`five_hour`, `seven_day`, and per-model `seven_day_opus` /
+`seven_day_sonnet`), each with a `utilization` and `resets_at`. We never call
+`/v1/messages`: the usage endpoint is read-only and spends no message quota.
+
+Authenticating reuses Claude Code's **own login** rather than asking for anything
+new: the OAuth token lives in the login Keychain under the generic-password
+service `Claude Code-credentials`, stored as a JSON blob
+(`{ claudeAiOauth: { accessToken, subscriptionType, rateLimitTier, … } }`). The
+same blob yields the plan label shown in the header (**Max (5x)** from
+`subscriptionType` + the `Nx` in `rateLimitTier`). Reading another app's keychain
+item triggers a one-time macOS prompt — hence the feature is **off until you opt
+in**, and stays granted across rebuilds because `build.sh` signs with a stable
+identity.
+
+This is an **undocumented** interface, so everything fragile is quarantined:
+
+- The endpoint, keychain service, beta header and User-Agent live in the
+  `UsageAPI` enum in `Sources/AwakeBar/Contract.swift` (app-only — unlike the hook
+  markers there's no shell mirror), so an upstream rename is a one-line fix; the
+  JSON decoder (`PlanLimits.swift`) is deliberately lenient about field spellings.
+- The **`User-Agent: claude-code/<ver>` header is load-bearing** — without it the
+  endpoint drops you into an aggressively rate-limited bucket that returns `429`
+  for many minutes. With it, AwakeBar still fetches sparingly: at most once every
+  ~10 minutes (on launch, the refresh tick, and menu-open), it parks for 45
+  minutes after a `429`, and a `401` (a rotated token) just skips the cycle —
+  Claude Code refreshes the token on its next run. `PlanLimitsCoordinator` owns
+  this throttle/cooldown so the menu code stays unaware of the network beneath.
+
+Cosmetics: each row's pie fills clockwise with the window and turns **red past
+75%**; reset times render with the system clock format (12-/24-hour) and locale;
+the header links to the usage page on the web.

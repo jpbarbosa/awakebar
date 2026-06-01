@@ -15,14 +15,21 @@ Product docs: [README.md](README.md). Mechanics & rationale: [DESIGN.md](DESIGN.
 
 - `Contract.swift` — the single source of truth for the hook IPC: the `/tmp`
   marker paths, VSCode bridge markers, reason tokens, and cwd sanitiser
-  (mirrored on the shell side by `claude-hook-contract.sh`).
+  (mirrored on the shell side by `claude-hook-contract.sh`). Also holds the
+  app-only `UsageAPI` constants for the plan-usage panel (no shell mirror).
 - `AwakeMonitor.swift` — reads `pmset -g assertions` and parses the VSCode
   extension-host log (Remote Control lifecycle + VSCode in-panel permission prompts).
 - `NotificationCoordinator.swift` — owns the "Claude is waiting / task finished /
   VSCode permission" notifications: scheduling, grace deferral, posting, withdrawal.
 - `PowerAssertion.swift` — holds AwakeBar's own `PreventUserIdleSystemSleep` assertion.
 - `AttentionWatcher.swift` — kqueue watcher over a `/tmp/claude-*.json` marker; fires a callback when it changes.
-- `AppDelegate.swift` — menu UI, power assertions, and the refresh loop; owns a `NotificationCoordinator`.
+- `PlanLimits.swift` — reads Claude Code's plan-usage limits (the `/usage` screen)
+  from the OAuth token: the Keychain read + `/api/oauth/usage` fetch, plus pure,
+  tested `decode`/`countdown`/token-parse helpers.
+- `PlanLimitsCoordinator.swift` — owns the plan-usage opt-in flag, the fetch
+  throttle, the 429 cooldown, and the last-known usage the menu renders.
+- `AppDelegate.swift` — menu UI, power assertions, and the refresh loop; owns a
+  `NotificationCoordinator` and a `PlanLimitsCoordinator`.
 - `main.swift` — entry point.
 
 Icon: `icon/make-icon.swift` (Core Graphics tile + composited cup, `icon/black-coffee-cup.png`,
@@ -40,6 +47,12 @@ Apple's SF Symbols licence bars its symbols from app icons.
 - **cwd parse anchor.** Only trust `launch_claude` / `Spawning Claude` lines for
   a session's cwd; the log also echoes back tool inputs that mention `cwd:` —
   don't match those.
+- **Plan-usage API is undocumented & rate-limit-touchy.** `PlanLimits` reuses
+  Claude Code's own OAuth token to hit `/api/oauth/usage`. The `User-Agent:
+  claude-code/<ver>` header is load-bearing — without it the endpoint 429s
+  persistently. It's read-only (never `/v1/messages`), fetched at most every
+  10 min, and parks for 45 min after a 429. Off by default; the toggle is the
+  user's consent to the one-time Keychain prompt.
 
 ## Hook ↔ app IPC (`/tmp`)
 

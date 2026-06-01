@@ -32,8 +32,9 @@ sleep normally**) and two live status lines:
   beneath it), `idle (sleep allowed)` once the idle timeout has released the
   hold, or `Off`.
 
-When the Mac is awake it also lists exactly what's responsible under **Kept
-awake by**, followed by the controls:
+When the Mac is awake, a **Kept Awake By** submenu lists exactly what's
+responsible. Turning on **Show Plan Usage** adds a **Plan Usage** section
+([below](#plan-usage)). Then the controls:
 
 ```
 ☕ Mac is being kept awake
@@ -42,16 +43,19 @@ awake by**, followed by the controls:
 ● Remote Control: Active
      awakebar
      maru
+  Kept Awake By    ▸
 ──────────────
-Kept awake by
-     caffeinate (Claude Code Hook)
-     AwakeBar (Remote Control session)
+↗ Max (5x) Plan Usage              Resets
+◑ Session: 53%                   in 2h 34m
+◑ Weekly: 23%                    Sat 07:00
+○ Weekly · Sonnet: 0%
 ──────────────
    Force Stay Awake
 ✓ Notify When Task Finishes
 ✓ Clear Notifications When Resumed
    Notification Delay     ▸
    Remote Idle Timeout    ▸
+✓ Show Plan Usage
 ✓ Open at Login
 ──────────────
 ⏻ Quit AwakeBar
@@ -59,7 +63,8 @@ Kept awake by
 
 The controls are **Force Stay Awake** (a manual hold that red-badges the cup),
 **Notify When Task Finishes**, **Clear Notifications When Resumed**,
-**Notification Delay**, **Remote Idle Timeout**, **Open at Login**, and **Quit**.
+**Notification Delay**, **Remote Idle Timeout**, **Show Plan Usage**, **Open at
+Login**, and **Quit**.
 
 ## Notifications
 
@@ -83,6 +88,30 @@ a stale banner doesn't linger after you've answered.
 The first notification prompts macOS for permission; turn the feature off by
 removing the hooks or via **System Settings ▸ Notifications**. See
 [DESIGN.md](DESIGN.md) for how the deferral, dedup, and VSCode-log path work.
+
+## Plan usage
+
+Turn on **Show Plan Usage** to mirror Claude Code's `/usage` screen in the menu —
+how much of your plan you've burned and when each window resets:
+
+- **Session** — your 5-hour rolling window (e.g. `53% · in 2h 34m`).
+- **Weekly** — the all-models weekly limit (e.g. `23% · Sat 07:00`), plus a
+  per-model row (e.g. **Weekly · Sonnet**) when you've used that model.
+
+Each row carries a small pie that fills as the window does and **turns red past
+75%**, so a glance tells you how close you are. The header names your plan
+(**Max (5x) Plan Usage**) and links to your usage page on the web.
+
+Reset times follow your Mac's clock format (12-/24-hour) and locale. The numbers
+update on a slow cadence — this is a glance, not a live dashboard.
+
+**Off by default**, because it reads data the others don't: it reuses your
+existing Claude Code login (the OAuth token in your Keychain) to fetch usage
+straight from Anthropic, so the first time you enable it macOS asks you to allow
+access to the `Claude Code-credentials` keychain item — click **Always Allow**.
+It's read-only, polls infrequently, and spends no message quota; the token never
+leaves your Mac. This uses an undocumented Claude Code interface, so it may need
+an update if Anthropic changes it — see [DESIGN.md](DESIGN.md).
 
 ## Install the hooks
 
