@@ -51,7 +51,12 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
         let idPrefix: String               // notification-id namespace
         var lastTs = 0                     // dedup cursor (primed at launch)
         var pending: DispatchWorkItem?     // the deferred-alert work item, if any
-        var delivered: [String: (id: String, ts: Int)] = [:]   // by cwd, for withdrawal
+        // Delivered alerts by cwd, for later withdrawal. A LIST per cwd, not one
+        // tuple: a session can deliver several banners before it resumes (two real
+        // tasks finish back to back, two waits in a row), and overwriting would
+        // orphan the earlier id so neither the resume nor the age sweep could ever
+        // withdraw it — the same fix deliveredVSCode carries (see below).
+        var delivered: [String: [(id: String, ts: Int)]] = [:]
         var watcher: AttentionWatcher?
         init(marker: String, idPrefix: String) {
             self.marker = marker
@@ -61,6 +66,12 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
     private let attention: MarkerPath
     private let done: MarkerPath
     private static let minTaskDuration: TimeInterval = 30
+    // A delivered "Task finished" banner is pure FYI: unlike a waiting alert you may
+    // never return to that session, so the resume signal that normally clears it
+    // (clearResumedByCwd) may never come — and the banner piles up in Notification
+    // Center. Withdraw one this old even if its session never resumed, mirroring the
+    // age-sweep staleVSCodeAlertAge applies to prompts that never log a resolve.
+    private static let staleDoneAlertAge: TimeInterval = 5 * 60
 
     // VSCode permission prompts surfaced via the extension log (see AwakeMonitor).
     // appLaunch floors out events logged before launch; lastVSNotify is the
@@ -73,7 +84,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
     // resolved or ages out (see clearResumedAttentions). A list, not one tuple, so
     // two prompts in the same project don't orphan the earlier id — that orphaning
     // is what left duplicate banners stuck in Notification Center. (The terminal
-    // paths track their delivered alerts on MarkerPath.delivered, above.)
+    // paths apply the same list-per-key fix on MarkerPath.delivered, above.)
     private var deliveredVSCode: [String: [(id: String, time: Date)]] = [:]
     // A delivered VSCode alert whose event has aged past this without ever showing
     // resolved (e.g. a permission prompt you denied or ignored, which logs no
@@ -233,7 +244,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
         let id = "\(p.idPrefix)-\(event.ts)"
         postAttentionNotification(project: event.project, message: message,
                                   id: id, cwd: event.cwd)
-        if let cwd = event.cwd { p.delivered[cwd] = (id, event.ts) }
+        if let cwd = event.cwd { p.delivered[cwd, default: []].append((id, event.ts)) }
     }
 
     // Claude is blocked on you — alert on every fresh event, carrying its message.
@@ -245,14 +256,16 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
     // A turn ended. Gate on the toggle (checked before the cursor advances, so
     // turning the feature off never consumes an event) and on whether the turn ran
     // long enough to be a real task — a quick reply stays quiet, an unknown -1
-    // duration errs toward notifying. Body is the fixed "Task finished".
+    // duration errs toward notifying. Body stamps the turn's finish time (the event
+    // ts, not when the deferred banner posts) so a banner you find later still says
+    // when it actually finished.
     // (internal, not private, so AwakeBarTests can drive it with a temp marker.)
     func handleDone() {
         guard notifyOnDone else { return }
         handle(done,
                accept: { AwakeMonitor.isRealTask(durationSeconds: $0.dur ?? -1,
                                                  minimum: Self.minTaskDuration) },
-               message: { _ in "Task finished" })
+               message: { "Task finished at \(Self.clockTime($0.ts))" })
     }
 
     // MARK: Withdrawing resumed alerts
@@ -269,6 +282,17 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
         // prompt / resumed the session), withdraw the banner.
         clearResumedByCwd(&attention.delivered)
         clearResumedByCwd(&done.delivered)
+        // ...but a finished task is one you may never return to, so that resume may
+        // never come. Sweep any done banner that has simply aged past
+        // staleDoneAlertAge so completed-task FYIs don't pile up unanswered.
+        let doneCut = Int(Date().timeIntervalSince1970 - Self.staleDoneAlertAge)
+        for (cwd, entries) in done.delivered {
+            let stale = entries.filter { $0.ts < doneCut }
+            guard !stale.isEmpty else { continue }
+            sink.withdraw(stale.map(\.id))
+            let rest = entries.filter { $0.ts >= doneCut }
+            done.delivered[cwd] = rest.isEmpty ? nil : rest
+        }
         // VSCode permission alerts that never showed resolved (denied/ignored
         // prompts log no resolve marker) would otherwise linger forever once their
         // event ages out of the freshness window. Sweep those stale banners by age.
@@ -285,10 +309,14 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
     // Withdraw and forget every delivered alert in a per-cwd map whose session has
     // shown activity past its event ts. Shared by the waiting and task-finished
     // maps (see clearResumedAttentions).
-    private func clearResumedByCwd(_ map: inout [String: (id: String, ts: Int)]) {
-        for (cwd, entry) in map where activityTs(forCwd: cwd) > entry.ts {
-            sink.withdraw([entry.id])
-            map[cwd] = nil
+    private func clearResumedByCwd(_ map: inout [String: [(id: String, ts: Int)]]) {
+        for (cwd, entries) in map {
+            let activity = activityTs(forCwd: cwd)
+            let resumed = entries.filter { activity > $0.ts }
+            guard !resumed.isEmpty else { continue }
+            sink.withdraw(resumed.map(\.id))
+            let rest = entries.filter { activity <= $0.ts }
+            map[cwd] = rest.isEmpty ? nil : rest
         }
     }
 
@@ -360,6 +388,16 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
             return "\(rest.prefix(1).uppercased())\(rest.dropFirst())"
         }
         return raw
+    }
+
+    // Format a marker ts (unix seconds) as a short wall-clock time for the
+    // "Task finished at …" body — e.g. "18:09" or "6:09 PM". Short style follows
+    // the user's 12/24-hour setting, the same one the menu-bar clock obeys.
+    nonisolated static func clockTime(_ ts: Int) -> String {
+        let f = DateFormatter()
+        f.dateStyle = .none
+        f.timeStyle = .short
+        return f.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
     }
 
     private func activateVSCode() {

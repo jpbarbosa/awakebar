@@ -174,11 +174,36 @@ struct NotificationCoordinatorTests {
         c.handleDone()
         #expect(sched.items.isEmpty)
 
-        // A real task (>= 30s) does alert, with the fixed body.
+        // A real task (>= 30s) does alert, stamped with the turn's finish time (its
+        // event ts, formatted by the same helper the body uses).
         writeMarker(done, project: "p", message: "Task finished", cwd: cwd, ts: 200, dur: 60)
         c.handleDone(); sched.fireDue()
         #expect(rec.postedIds == ["claude-done-200"])
-        #expect(rec.body(of: "claude-done-200") == "Task finished")
+        #expect(rec.body(of: "claude-done-200")
+                == "Task finished at \(NotificationCoordinator.clockTime(200))")
+    }
+
+    @Test func multipleDoneBannersInOneCwdAllWithdrawnOnResume() {
+        let rec = Recorder(), sched = CaptureScheduler()
+        let done = tempFile(), cwd = tempCwd()
+        defer { clean(done, Contract.activityMarkerPath(forCwd: cwd)) }
+        let c = makeCoordinator(rec, sched, attention: tempFile(), done: done)
+        normalize(c, autoClear: true, notifyDone: true)
+
+        // Two real tasks finish in the SAME session without a resume between them,
+        // both recent enough that the age sweep won't touch them. Tracking a LIST
+        // per cwd (not one tuple) keeps the second delivery from orphaning the
+        // first id — so the resume below withdraws BOTH, not just the latest.
+        let now = Int(Date().timeIntervalSince1970)
+        writeMarker(done, project: "p", message: "Task finished", cwd: cwd, ts: now - 20, dur: 60)
+        c.handleDone(); sched.fireDue(); sched.items.removeAll()
+        writeMarker(done, project: "p", message: "Task finished", cwd: cwd, ts: now - 10, dur: 60)
+        c.handleDone(); sched.fireDue()
+        #expect(rec.postedIds == ["claude-done-\(now - 20)", "claude-done-\(now - 10)"])
+
+        writeActivity(forCwd: cwd, ts: now)         // you resumed the session
+        c.clearResumedAttentions()
+        #expect(Set(rec.withdrawn) == ["claude-done-\(now - 20)", "claude-done-\(now - 10)"])
     }
 
     @Test func notifyOnDoneOffDoesNotConsumeTheEvent() {
@@ -197,5 +222,31 @@ struct NotificationCoordinatorTests {
         c.toggleNotifyOnDone()
         c.handleDone(); sched.fireDue()
         #expect(rec.postedIds == ["claude-done-100"])
+    }
+
+    @Test func staleTaskFinishedBannerSweptEvenWithoutResume() {
+        let rec = Recorder(), sched = CaptureScheduler()
+        let done = tempFile(), oldCwd = tempCwd(), freshCwd = tempCwd()
+        defer { clean(done, Contract.activityMarkerPath(forCwd: oldCwd),
+                      Contract.activityMarkerPath(forCwd: freshCwd)) }
+        let c = makeCoordinator(rec, sched, attention: tempFile(), done: done)
+        normalize(c, autoClear: true, notifyDone: true)
+
+        // Two finished tasks, neither ever resumed (no activity marker). Events only
+        // ever increase in ts, so the aged one is delivered first: a day-old turn,
+        // then a just-now turn in a different session.
+        let now = Int(Date().timeIntervalSince1970)
+        let old = now - 24 * 60 * 60
+        writeMarker(done, project: "old", message: "Task finished", cwd: oldCwd, ts: old, dur: 60)
+        c.handleDone(); sched.fireDue()
+        sched.items.removeAll()   // a real asyncAfter queue drains the fired item
+        writeMarker(done, project: "fresh", message: "Task finished", cwd: freshCwd, ts: now, dur: 60)
+        c.handleDone(); sched.fireDue()
+        #expect(rec.postedIds == ["claude-done-\(old)", "claude-done-\(now)"])
+
+        // One sweep withdraws only the aged banner; the fresh one stays (its session
+        // may still resume, or it'll age out on a later pass).
+        c.clearResumedAttentions()
+        #expect(rec.withdrawn == ["claude-done-\(old)"])
     }
 }

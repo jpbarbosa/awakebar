@@ -46,22 +46,36 @@ esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 # the marker key matches AwakeBar's exactly.
 safe_cwd() { claude_marker_key "$(field cwd)"; }
 
+# Project label shown in the notification title. The git repo root's basename —
+# i.e. the workspace root, not the subdir a session happens to run in, so
+# …/maru/frontend and …/maru/backend both read "maru" rather than "frontend"/
+# "backend". Falls back to the cwd's own basename outside a git repo (or with no
+# git on PATH). Display-only: the per-cwd activity/dedup keying is unchanged, so
+# sibling sessions in one repo stay independent even though they share a title.
+project_name() {
+  local cwd="$1" root
+  # Guard the empty cwd: `git -C ""` runs in the hook's own directory and could
+  # report an unrelated repo's root, so only consult git when we have a cwd.
+  [ -n "$cwd" ] && root=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null)
+  [ -n "$root" ] && cwd="$root"
+  printf '%s' "${cwd##*/}"
+}
+
 # Write { project, message, cwd, ts, dur } to $1 with message $2 and duration $3
 # (seconds, default -1 = unknown). jq builds it when present so any characters in
 # the message escape correctly; an sed/printf fallback covers a jq-less box.
 write_marker() {
   local file="$1" message="$2" dur="${3:--1}" cwd project
+  cwd=$(field cwd)
+  project=$(project_name "$cwd")
   if command -v jq >/dev/null 2>&1; then
     if printf '%s' "$input" | jq -c --argjson ts "$ts" --arg msg "$message" \
-          --argjson dur "$dur" '
-          (.cwd // "") as $cwd
-          | { project: ($cwd | split("/") | last), message: $msg,
-              cwd: $cwd, ts: $ts, dur: $dur }' > "$file" 2>/dev/null; then
+          --arg project "$project" --argjson dur "$dur" '
+          { project: $project, message: $msg,
+            cwd: (.cwd // ""), ts: $ts, dur: $dur }' > "$file" 2>/dev/null; then
       return 0
     fi
   fi
-  cwd=$(field cwd)
-  project="${cwd##*/}"
   printf '{"project":"%s","message":"%s","cwd":"%s","ts":%s,"dur":%s}\n' \
     "$(esc "$project")" "$(esc "$message")" "$(esc "$cwd")" "$ts" "$dur" > "$file"
 }

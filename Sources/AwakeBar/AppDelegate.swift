@@ -20,6 +20,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // important because a refresh may land while the menu is open.
     private var lastMenuSignature: String?
 
+    // The ⌥-gated rows — Notify When Task Finishes, Notification Delay, Remote
+    // Idle Timeout — are hidden unless Option is held, keeping the common menu
+    // short. markAdvanced collects them on each rebuild; optionHeld is the live
+    // modifier state while the menu is open (read at open time in menuWillOpen,
+    // then tracked by flagsMonitor so the rows toggle as ⌥ is pressed/released).
+    private var advancedItems: [NSMenuItem] = []
+    private var optionHeld = false
+    private var flagsMonitor: Any?
+
     // Power assertions AwakeBar holds itself. The remote one tracks Remote
     // Control automatically — so the Mac stays awake even in the gap between
     // turns the event-driven keep-awake hook can't cover. The manual one is the
@@ -63,9 +72,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let menu = NSMenu()
         menu.delegate = self
-        // Don't auto-disable action-less items — the info rows stay "enabled"
-        // so AppKit renders them at full/secondary label color instead of the
-        // dimmed "disabled command" gray.
+        // We manage enabled state ourselves. The readout rows are custom views
+        // (InfoRowView) that never highlight or fade, so they don't depend on
+        // this; what it guards is the action-less submenu parents (Kept Awake By,
+        // Notification Delay, Remote Idle Timeout) — they must stay enabled to
+        // open even though they carry no action of their own.
         menu.autoenablesItems = false
         statusItem.menu = menu
 
@@ -97,8 +108,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // appears instantly with the last poll's data (≤10s old) and updates in
     // place a moment later if anything changed.
     func menuWillOpen(_ menu: NSMenu) {
+        // Reveal the ⌥-gated rows if Option is already held as the menu opens,
+        // then track the key live for the duration it's open.
+        optionHeld = NSEvent.modifierFlags.contains(.option)
+        applyOptionVisibility()
+        installOptionMonitor()
         refresh()
         planLimits.refreshIfDue()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        removeOptionMonitor()
+        optionHeld = false   // back to the short menu for the next open / rebuild
+    }
+
+    // Show or hide the ⌥-gated rows for the current optionHeld state. Setting
+    // isHidden relayouts the menu in place, so this works whether it's called
+    // before the menu draws (menuWillOpen) or while it's already on screen.
+    private func applyOptionVisibility() {
+        for item in advancedItems { item.isHidden = !optionHeld }
+    }
+
+    // While the menu is open, watch ⌥ so the gated rows appear/disappear as the
+    // key is pressed — not just per its state at open time. The monitor is local
+    // (events bound for this app) and torn down in menuDidClose.
+    private func installOptionMonitor() {
+        guard flagsMonitor == nil else { return }
+        flagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let held = event.modifierFlags.contains(.option)
+                if held != self.optionHeld {
+                    self.optionHeld = held
+                    self.applyOptionVisibility()
+                }
+            }
+            return event
+        }
+    }
+
+    private func removeOptionMonitor() {
+        if let flagsMonitor { NSEvent.removeMonitor(flagsMonitor) }
+        flagsMonitor = nil
     }
 
     // Kick off a background collection; coalesce so overlapping triggers (the
@@ -274,41 +325,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func rebuildMenu(awake: Bool) {
         guard let menu = statusItem.menu else { return }
         menu.removeAllItems()
+        advancedItems.removeAll()   // repopulated by markAdvanced as rows are added
 
-        // Headline — primary status: full-contrast label color, flat icon.
-        let header = infoItem(awake ? "Mac is being kept awake"
-                                    : "Mac can sleep normally",
-                              color: .labelColor)
-        // The cup shares the same fixed leading slot as every other row, so the
-        // headline lines up with the status dots and the controls below.
+        // The reset column and the shared width for every readout row: the resets
+        // right-align to tabX (measured from the text origin), and every custom
+        // row spans the same width so the column lands at the menu's right edge.
+        let tabX = planResetColumnX()
+        let rowWidth = ceil(Self.infoRowTextX + tabX + Self.infoRowTrailing)
+
+        // Headline — primary status: full-contrast label color, flat cup icon. The
+        // cup shares the same leading slot as every other row, so the headline
+        // lines up with the status dots and the controls below. (It's a template
+        // symbol, so it's tinted to labelColor for drawing inside the custom view.)
         let cup = NSImage(
             systemSymbolName: awake ? "cup.and.saucer.fill" : "cup.and.saucer",
             accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
-        header.image = leadingSlot(cup, template: true)
-        menu.addItem(header)
+        menu.addItem(infoRow(
+            leading: tinted(leadingSlot(cup, template: true), .labelColor),
+            infoText(awake ? "Mac is being kept awake" : "Mac can sleep normally",
+                     color: .labelColor),
+            width: rowWidth))
 
         // Claude Code hook + live remote-control status — secondary info.
         menu.addItem(.separator())
-        menu.addItem(infoItem(claudeHookStatusText(), color: .secondaryLabelColor,
-                              status: snap.hookActive))
+        menu.addItem(infoRow(
+            leading: leadingSlot(statusDot(active: snap.hookActive), template: false),
+            infoText(claudeHookStatusText(), color: .secondaryLabelColor),
+            width: rowWidth))
         if snap.remoteControlActive {
             // Connected but the hold released means the session went idle past the
             // timeout — the bridge is still up, we've just stopped forcing awake.
             let idle = !remoteAssertion.held
-            menu.addItem(infoItem(idle ? "Remote Control: idle (sleep allowed)"
-                                       : "Remote Control: Active",
-                                  color: .secondaryLabelColor, status: !idle))
-            for project in snap.remoteProjects {
-                // Spacer where the parent has its dot, so each project's name lines
-                // up flush-left with the "Remote Control:" label above it.
-                let row = infoItem(project, color: .secondaryLabelColor)
-                row.image = spacerSlot()
-                menu.addItem(row)
+            // Thread the project rows onto a vertical line dropping from the
+            // Remote Control dot: green while active, grey when idle (matching the
+            // dot). Only when there are projects to connect, else a lone line
+            // would dangle. The line lives in the icon column, so the project
+            // names stay flush under the "Remote Control:" label — no indentation.
+            let lineColor: NSColor = idle ? .tertiaryLabelColor : .systemGreen
+            let projects = snap.remoteProjects
+            menu.addItem(infoRow(
+                leading: leadingSlot(statusDot(active: !idle), template: false),
+                infoText(idle ? "Remote Control: idle (sleep allowed)"
+                              : "Remote Control: Active", color: .secondaryLabelColor),
+                width: rowWidth,
+                connector: projects.isEmpty ? nil
+                    : .init(top: false, bottom: true, node: false, color: lineColor)))
+            for (i, project) in projects.enumerated() {
+                // No leading icon: the small connector node sits in the icon
+                // column and the name lines up flush under the label above. The
+                // line passes through every project and stops at the last one.
+                menu.addItem(infoRow(
+                    leading: nil,
+                    infoText(project, color: .secondaryLabelColor),
+                    width: rowWidth,
+                    connector: .init(top: true, bottom: i < projects.count - 1,
+                                     node: true, color: lineColor)))
             }
         } else {
-            menu.addItem(infoItem("Remote Control: Off", color: .secondaryLabelColor,
-                                  status: false))
+            menu.addItem(infoRow(
+                leading: leadingSlot(statusDot(active: false), template: false),
+                infoText("Remote Control: Off", color: .secondaryLabelColor),
+                width: rowWidth))
         }
 
         // What's actually holding the Mac awake — the process/assertion breakdown.
@@ -322,16 +400,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if remoteAssertion.held { keptAwakeBy.append("AwakeBar (Remote Control session)") }
         if manualAssertion.held { keptAwakeBy.append("AwakeBar (manual)") }
         if awake && !keptAwakeBy.isEmpty {
-            let parent = infoItem("Kept Awake By", color: .secondaryLabelColor)
+            // A real submenu parent — kept a standard item so it highlights and
+            // expands like the other submenus. Its children are readout rows.
+            let parent = NSMenuItem(title: "Kept Awake By", action: nil, keyEquivalent: "")
+            parent.attributedTitle = infoText("Kept Awake By", color: .secondaryLabelColor)
             parent.image = spacerSlot()   // align with the dotted status rows' text
             let sub = NSMenu()
             sub.autoenablesItems = false
-            for label in keptAwakeBy { sub.addItem(infoItem(label, color: .secondaryLabelColor)) }
+            for label in keptAwakeBy {
+                let text = infoText(label, color: .secondaryLabelColor)
+                sub.addItem(infoRow(leading: nil, text, width: infoRowWidth(for: text)))
+            }
             parent.submenu = sub
             menu.addItem(parent)
         }
 
-        addPlanUsage(to: menu)
+        addPlanUsage(to: menu, tabX: tabX, rowWidth: rowWidth)
 
         menu.addItem(.separator())
 
@@ -342,32 +426,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Notify when a task finishes — gated on how long the turn ran (real tasks
         // ping, quick replies don't), independent of which window you're in.
-        addToggle(to: menu, title: "Notify When Task Finishes",
+        // ⌥-gated: a set-once toggle, hidden from the common menu.
+        markAdvanced(addToggle(to: menu, title: "Notify When Task Finishes",
                   action: #selector(toggleNotifyOnDone), on: notifications.notifyOnDone,
-                  toolTip: "Post a notification when a task (a turn longer than ~30s) finishes, whatever window you're in")
+                  toolTip: "Post a notification when a task (a turn longer than ~30s) finishes, whatever window you're in"))
 
         // Withdraw a delivered "Claude is waiting" alert once that session resumes
         // after you act. On by default; turn off to keep alerts in Notification
-        // Center as a record.
-        addToggle(to: menu, title: "Clear Notifications When Resumed",
+        // Center as a record. ⌥-gated: a set-once toggle, hidden from the common menu.
+        markAdvanced(addToggle(to: menu, title: "Clear Notifications When Resumed",
                   action: #selector(toggleAutoClear), on: notifications.autoClearAlerts,
-                  toolTip: "Withdraw a \u{201C}Claude is waiting\u{201D} notification once that session starts running again")
+                  toolTip: "Withdraw a \u{201C}Claude is waiting\u{201D} notification once that session starts running again"))
 
         // How long a blocked session waits before alerting — answer within the
         // delay and no notification fires. A checkmark marks the active choice.
-        addChoiceSubmenu(to: menu, title: "Notification Delay", action: #selector(setGrace(_:)),
+        // ⌥-gated: a set-once knob, hidden from the common menu.
+        markAdvanced(addChoiceSubmenu(to: menu, title: "Notification Delay", action: #selector(setGrace(_:)),
                          choices: NotificationCoordinator.graceChoices.map {
                              (label: "\(Int($0)) Seconds", tag: Int($0)) },
-                         selected: Int(notifications.attentionGrace))
+                         selected: Int(notifications.attentionGrace)))
 
         // How long a remote session may idle before the Mac is allowed to sleep —
         // a turn or prompt resets the timer. A checkmark marks the active choice.
-        addChoiceSubmenu(to: menu, title: "Remote Idle Timeout",
+        // ⌥-gated: a set-once knob, hidden from the common menu.
+        markAdvanced(addChoiceSubmenu(to: menu, title: "Remote Idle Timeout",
                          action: #selector(setRemoteIdle(_:)),
                          choices: Self.remoteIdleChoices.map {
                              (label: $0.label, tag: Int($0.seconds)) },
                          selected: Int(remoteIdleTimeout),
-                         toolTip: "Let the Mac sleep after this long with no activity on a remote-controlled session (a turn resets the timer). Off keeps it awake as long as the bridge is connected.")
+                         toolTip: "Let the Mac sleep after this long with no activity on a remote-controlled session (a turn resets the timer). Off keeps it awake as long as the bridge is connected."))
 
         // Surface the Claude Code plan limits (the /usage screen). Off by default;
         // turning it on reads the OAuth token from the Keychain (one-time prompt).
@@ -391,23 +478,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(quit)
     }
 
-    // A non-interactive informational row, drawn at an explicit color via
-    // attributedTitle — rather than the dimmed "disabled command" gray a
-    // plain disabled item would get.
-    private func infoItem(_ text: String, color: NSColor, indent: Int = 0,
-                          status: Bool? = nil) -> NSMenuItem {
-        // Left enabled (the menu has autoenablesItems = false) so AppKit does
-        // not dim it; with no action it is still effectively non-interactive.
-        let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
-        item.indentationLevel = indent
-        item.attributedTitle = NSAttributedString(
-            string: text,
-            attributes: [.foregroundColor: color,
-                         .font: NSFont.menuFont(ofSize: 0)])
-        if let status, indent == 0 {
-            item.image = leadingSlot(statusDot(active: status), template: false)
-        }
+    // Horizontal/vertical layout for the custom info-row views (InfoRowView),
+    // tuned so their icon and text columns line up with the standard control
+    // rows. imageX is the left edge of the 16pt icon slot; textX is the left edge
+    // of the text — set equal to the standard item's title origin so a plan row's
+    // "Resets" column (a right tab the standard header carries) lines up with the
+    // custom value rows below. trailing is the padding past the reset column.
+    private static let infoRowImageX: CGFloat = 14
+    private static let infoRowTextX: CGFloat = 36
+    private static let infoRowHeight: CGFloat = 22
+    private static let infoRowTrailing: CGFloat = 16
+
+    // Menu text at a given colour, in the menu font — the body of a readout row.
+    private func infoText(_ text: String, color: NSColor) -> NSAttributedString {
+        NSAttributedString(string: text, attributes: [
+            .foregroundColor: color, .font: NSFont.menuFont(ofSize: 0)])
+    }
+
+    // A non-interactive readout row, rendered as a custom view (InfoRowView) so it
+    // neither takes the blue hover highlight nor gets AppKit's disabled-item fade.
+    // `leading` is a fully-composed slot-sized icon (dot/pie/cup) or nil; the row
+    // is left disabled so keyboard navigation skips it (the view draws regardless).
+    private func infoRow(leading: NSImage?, _ attributed: NSAttributedString,
+                         width: CGFloat,
+                         connector: InfoRowView.Connector? = nil) -> NSMenuItem {
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        item.view = InfoRowView(
+            leading: leading, attributed: attributed, width: width,
+            height: Self.infoRowHeight, imageX: Self.infoRowImageX,
+            textX: Self.infoRowTextX, slotSize: Self.leadingSlotSize,
+            connector: connector)
         return item
+    }
+
+    // Width for a readout row whose text has no reset column — just enough to fit
+    // the text past the icon, plus trailing padding (used for the Kept Awake By
+    // submenu children, whose menu sizes to its own widest row).
+    private func infoRowWidth(for attributed: NSAttributedString) -> CGFloat {
+        ceil(Self.infoRowTextX + attributed.size().width + Self.infoRowTrailing)
+    }
+
+    // Recolour a template symbol to `color` for drawing inside a custom view,
+    // where AppKit's automatic template tinting doesn't apply (used for the header
+    // cup). The status dots and pies are non-template and already carry a colour.
+    private func tinted(_ image: NSImage, _ color: NSColor) -> NSImage {
+        let out = NSImage(size: image.size)
+        out.lockFocus()
+        let rect = NSRect(origin: .zero, size: image.size)
+        image.draw(in: rect)
+        color.set()
+        rect.fill(using: .sourceAtop)
+        out.unlockFocus()
+        out.isTemplate = false
+        return out
     }
 
     // A small leading status dot for info rows: filled green when the subsystem
@@ -466,21 +590,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // A checkmarked toggle row wired to `action`, the checkmark sharing the
     // leading slot — the shape every main-menu toggle uses.
+    @discardableResult
     private func addToggle(to menu: NSMenu, title: String, action: Selector,
-                           on: Bool, toolTip: String = "") {
+                           on: Bool, toolTip: String = "") -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
         item.target = self
         if !toolTip.isEmpty { item.toolTip = toolTip }
         item.image = checkmarkSlot(on)
         menu.addItem(item)
+        return item
+    }
+
+    // Tag a freshly-added row as ⌥-gated: hidden unless Option is held when the
+    // menu opens (see applyOptionVisibility). Collected fresh on every rebuild.
+    private func markAdvanced(_ item: NSMenuItem) {
+        item.isHidden = !optionHeld
+        advancedItems.append(item)
     }
 
     // A submenu of mutually-exclusive choices, each tagged with its integer value
     // and checkmarked when it is the active one. Used by Notification Delay and
     // Remote Idle Timeout.
+    @discardableResult
     private func addChoiceSubmenu(to menu: NSMenu, title: String, action: Selector,
                                   choices: [(label: String, tag: Int)], selected: Int,
-                                  toolTip: String = "") {
+                                  toolTip: String = "") -> NSMenuItem {
         let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         if !toolTip.isEmpty { parent.toolTip = toolTip }
         let sub = NSMenu()
@@ -495,6 +629,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         parent.submenu = sub
         parent.image = spacerSlot()
         menu.addItem(parent)
+        return parent
     }
 
     // The always-present Claude line. Between turns the hook's caffeinate is
@@ -506,7 +641,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if snap.hookActive {
             switch snap.hookReason {
             case .turn:
-                return "Claude Code Hook: Claude is working"
+                return "Claude Code Hook: working"
             case .remote:
                 // The reason file can be stale if remote control dropped
                 // between turns — verify against the live check.
@@ -556,20 +691,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Render the plan-usage section per the coordinator's state. Off shows
     // nothing (the "Show Plan Usage" toggle is the entry point); a ready state
     // shows one row per present limit, mirroring the /usage screen.
-    private func addPlanUsage(to menu: NSMenu) {
+    private func addPlanUsage(to menu: NSMenu, tabX: CGFloat, rowWidth: CGFloat) {
         guard planLimits.status != .off else { return }
         menu.addItem(.separator())
-        let tabX = planResetColumnX()   // shared reset column for the header + rows
         menu.addItem(planHeaderItem(tabX: tabX))   // clickable: opens claude.ai
         switch planLimits.status {
         case .ready:
-            if let u = planLimits.usage, !u.isEmpty { addPlanPieRows(to: menu, usage: u, tabX: tabX) }
-            else { menu.addItem(planInfoRow("Unavailable")) }
-        case .loading:      menu.addItem(planInfoRow("Loading…"))
-        case .noToken:      menu.addItem(planInfoRow("Sign in to Claude Code first"))
-        case .unauthorized: menu.addItem(planInfoRow("Reauthorizing…"))
-        case .rateLimited:  menu.addItem(planInfoRow("Rate-limited — will retry later"))
-        case .error:        menu.addItem(planInfoRow("Unavailable"))
+            if let u = planLimits.usage, !u.isEmpty {
+                addPlanPieRows(to: menu, usage: u, tabX: tabX, rowWidth: rowWidth)
+            } else { menu.addItem(planInfoRow("Unavailable", width: rowWidth)) }
+        case .loading:      menu.addItem(planInfoRow("Loading…", width: rowWidth))
+        case .noToken:      menu.addItem(planInfoRow("Sign in to Claude Code first", width: rowWidth))
+        case .unauthorized: menu.addItem(planInfoRow("Reauthorizing…", width: rowWidth))
+        case .rateLimited:  menu.addItem(planInfoRow("Rate-limited — will retry later", width: rowWidth))
+        case .error:        menu.addItem(planInfoRow("Unavailable", width: rowWidth))
         case .off:          break   // guarded above
         }
     }
@@ -599,21 +734,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(UsageAPI.webUsageURL)
     }
 
-    // One plan-usage row, aligned to the shared text column like the project rows.
-    private func planInfoRow(_ text: String) -> NSMenuItem {
-        let row = infoItem(text, color: .secondaryLabelColor)
-        row.image = spacerSlot()
-        return row
+    // One plan-usage status row (no pie), aligned to the shared text column.
+    private func planInfoRow(_ text: String, width: CGFloat) -> NSMenuItem {
+        infoRow(leading: nil, infoText(text, color: .secondaryLabelColor), width: width)
     }
 
     // Past this fraction a limit's pie turns to the warning colour — "you're
     // getting close" rather than a hard stop.
     private static let planWarnThreshold = 0.75
 
-    // The ready state: one standard row per present limit — a pie via item.image
-    // (auto-aligned with the other rows' icons, no manual measuring) and
-    // "label: pct" with the reset right-aligned to the shared tab column.
-    private func addPlanPieRows(to menu: NSMenu, usage u: PlanLimits.Usage, tabX: CGFloat) {
+    // The ready state: one readout row per present limit — a pie in the leading
+    // slot (auto-aligned with the other rows' icons) and "label: pct" with the
+    // reset right-aligned to the shared tab column.
+    private func addPlanPieRows(to menu: NSMenu, usage u: PlanLimits.Usage,
+                                tabX: CGFloat, rowWidth: CGFloat) {
         let now = Date()
         func add(_ label: String, _ w: PlanLimits.Window?, relative: Bool) {
             guard let w else { return }
@@ -622,12 +756,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 relative ? PlanLimits.countdown(to: $0, now: now)   // "in 3h 10m"
                          : Self.resetWhen($0)                        // "Sat 07:00"
             } ?? ""
-            let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-            item.attributedTitle = planAttributed(left: "\(label): \(pct)%", right: reset, tabX: tabX)
-            item.image = leadingSlot(planPie(fraction: w.utilization / 100,
-                                             warn: w.utilization > Self.planWarnThreshold * 100),
-                                     template: false)
-            menu.addItem(item)
+            let pie = leadingSlot(planPie(fraction: w.utilization / 100,
+                                          warn: w.utilization > Self.planWarnThreshold * 100),
+                                  template: false)
+            menu.addItem(infoRow(leading: pie,
+                                 planAttributed(left: "\(label): \(pct)%", right: reset, tabX: tabX),
+                                 width: rowWidth))
         }
         add("Session", u.fiveHour, relative: true)
         add("Weekly", u.sevenDay, relative: false)

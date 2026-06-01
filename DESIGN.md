@@ -14,8 +14,11 @@ for exactly those two cases, wired via `notify-attention.sh`.
 On `Notification` the hook drops a marker at `/tmp/claude-attention.json`
 (`project`, `message`, `cwd`, and a `ts` dedup key); AwakeBar watches it with a
 kqueue source — so it reacts instantly, not bound to the 10s poll — and posts the
-notification via `UNUserNotificationCenter`, titled `Claude · <project>` so
-concurrent sessions are distinguishable. The body drops the leading "Claude" so
+notification via `UNUserNotificationCenter`, titled `Claude · <project>`, where
+`<project>` is the session cwd's git-root basename (the workspace root, so a
+session in `…/maru/frontend` reads `maru`, not `frontend`; it falls back to the
+cwd's own basename outside a git repo) — so sessions across repos are
+distinguishable, though sibling sessions in one repo share a title. The body drops the leading "Claude" so
 it doesn't echo that title — *"Claude is requesting permission to use Bash"*
 becomes **Requesting permission to use Bash**, *"Claude is waiting for your
 input"* becomes **Waiting for your input** — and alerts from one session stack
@@ -64,14 +67,18 @@ still told the moment it's done). `notify-attention.sh` records the turn's start
 on `UserPromptSubmit` and, on `Stop`, writes a marker at `/tmp/claude-done.json`
 (`project`/`message`/`cwd`/`ts` plus `dur`, the turn's length in seconds)
 alongside the activity bump. AwakeBar watches it on its own kqueue source and
-posts a *"Task finished"* banner when `dur` is at least **30 s** — a real task —
-so quick conversational replies stay quiet (a `dur` of −1, meaning the start
-wasn't recorded, errs toward notifying). It's deferred by the same grace as the
-waiting alerts (the **Notification Delay** menu): resume the session within that
-window — a new prompt bumps the activity marker past the done timestamp — and the
-banner never fires, since you clearly saw it finish. Resume *after* it has posted
-and, when **Clear Notifications When Resumed** is on, the next poll (≤10 s)
-withdraws it. Toggle it with **Notify When Task Finishes** in the menu (on by
+posts a *"Task finished at HH:mm"* banner — stamped with when the turn ended, so
+a banner you spot later still says when it actually finished — when `dur` is at
+least **30 s** — a real task — so quick conversational replies stay quiet (a `dur`
+of −1, meaning the start wasn't recorded, errs toward notifying). It's deferred by
+the same grace as the waiting alerts (the **Notification Delay** menu): resume the
+session within that window — a new prompt bumps the activity marker past the done
+timestamp — and the banner never fires, since you clearly saw it finish. Resume
+*after* it has posted and, when **Clear Notifications When Resumed** is on, the
+next poll (≤10 s) withdraws it. But a finished task is one you may never return
+to, so that resume may never come; a delivered banner that has simply aged past
+**5 minutes** is swept anyway, so completed-task FYIs don't pile up unanswered in
+Notification Center. Toggle it with **Notify When Task Finishes** in the menu (on by
 default); it needs no extra wiring beyond the `Stop` and `UserPromptSubmit`
 events. This works in **VSCode too** — the `Stop` hook fires there even though the
 `Notification` hook doesn't, so it fills the gap the in-panel-only permission
