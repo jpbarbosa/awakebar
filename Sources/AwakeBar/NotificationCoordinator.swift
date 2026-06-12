@@ -1,3 +1,4 @@
+import AVFoundation         // AVAudioPlayer, so the buzz volume is adjustable
 import Cocoa
 import UserNotifications    // UNUserNotificationCenter, for "Claude is waiting" alerts
 
@@ -116,11 +117,13 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
         // set the key, so the defaults below hold until they toggle something.
         UserDefaults.standard.register(defaults: [Self.autoClearKey: true,
                                                   Self.notifyDoneKey: true,
-                                                  Self.graceKey: 10.0])
+                                                  Self.graceKey: 10.0,
+                                                  Self.volumeKey: SoundVolume.mid.rawValue])
         autoClearAlerts = UserDefaults.standard.bool(forKey: Self.autoClearKey)
         notifyOnDone = UserDefaults.standard.bool(forKey: Self.notifyDoneKey)
         let savedGrace = UserDefaults.standard.double(forKey: Self.graceKey)
         attentionGrace = Self.graceChoices.contains(savedGrace) ? savedGrace : 10
+        soundVolume = SoundVolume(rawValue: UserDefaults.standard.integer(forKey: Self.volumeKey)) ?? .mid
     }
 
     // Authorize, drop stale banners, prime the dedup cursors from any markers left
@@ -357,6 +360,68 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
         AwakeMonitor.activityTs(forCwd: cwd)
     }
 
+    // MARK: Sound
+    //
+    // A short "buzz" played through AVAudioPlayer rather than UNNotificationSound.
+    // macOS exposes no API to set a notification sound's volume (the only volume-
+    // control initialisers are for critical alerts, which need a special
+    // entitlement and blast through Do Not Disturb), so to make the menu's
+    // Low/Mid/High Notification Volume work we own playback: one bundled file
+    // (sound/buzz.aiff) played at a scaled volume, so every level is the same
+    // sound at a different loudness. The notification itself carries no sound.
+    //
+    // Trade-off vs. a system sound: this plays even under Do Not Disturb / Focus,
+    // where UNNotificationSound would be suppressed.
+    enum SoundVolume: Int, CaseIterable {
+        case low = 1, mid = 2, high = 3
+        var label: String {
+            switch self {
+            case .low: "Low"
+            case .mid: "Mid"
+            case .high: "High"
+            }
+        }
+        // Linear AVAudioPlayer volume (0...1). High is the file as-is; Mid/Low
+        // attenuate it (~-6 dB / ~-14 dB).
+        var gain: Float {
+            switch self {
+            case .low: 0.2
+            case .mid: 0.5
+            case .high: 1.0
+            }
+        }
+    }
+    private static let volumeKey = "soundVolume"
+    private(set) var soundVolume: SoundVolume = .mid
+
+    // Loaded once from the bundle and retained so playback isn't cut short by the
+    // player deallocating. nil (asset missing / undecodable) just means no sound.
+    private lazy var buzzPlayer: AVAudioPlayer? = {
+        guard let url = Bundle.main.url(forResource: "buzz", withExtension: "aiff"),
+              let player = try? AVAudioPlayer(contentsOf: url) else { return nil }
+        player.prepareToPlay()
+        return player
+    }()
+
+    private func playBuzz() {
+        guard let player = buzzPlayer else { return }
+        player.volume = soundVolume.gain
+        player.currentTime = 0   // rewind so back-to-back alerts each ring in full
+        player.play()
+    }
+
+    // Pick the buzz loudness. Returns whether it changed, so the menu can skip a
+    // redundant re-render on a no-op tap (mirrors setGrace). Plays a preview so the
+    // level is audible the moment it's chosen.
+    @discardableResult
+    func setVolume(_ level: SoundVolume) -> Bool {
+        guard level != soundVolume else { return false }
+        soundVolume = level
+        UserDefaults.standard.set(level.rawValue, forKey: Self.volumeKey)
+        playBuzz()
+        return true
+    }
+
     // MARK: Posting
 
     // Shared notification poster for both the terminal (hook/marker) and VSCode
@@ -368,7 +433,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
         content.title = p.map { "Claude · \($0)" } ?? "Claude Code"
         let raw = (message?.isEmpty == false) ? message! : "Claude is waiting for you"
         content.body = Self.tightenBody(raw)
-        content.sound = .default
+        content.sound = nil   // we play the buzz ourselves, at the chosen volume
         // Stack alerts from the same session under one header in Notification
         // Center instead of listing every repeat — group by cwd (terminal) and
         // fall back to the project name (VSCode path has no cwd).
@@ -376,6 +441,7 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
         if let cwd { content.userInfo = ["cwd": cwd] }
         let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
         sink.post(request)
+        playBuzz()
     }
 
     // The notification body comes from Claude Code, which prefixes "Claude" — the

@@ -431,6 +431,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                   action: #selector(toggleNotifyOnDone), on: notifications.notifyOnDone,
                   toolTip: "Post a notification when a task (a turn longer than ~30s) finishes, whatever window you're in"))
 
+        // How loud the notification buzz plays. The three levels are the same
+        // bundled sound at scaled volume (AVAudioPlayer, since macOS has no API to
+        // set a notification sound's volume); picking one previews it. Kept in the
+        // common menu — unlike the set-once knobs, you tune this by ear.
+        addChoiceSubmenu(to: menu, title: "Notification Volume",
+                         action: #selector(setVolume(_:)),
+                         choices: NotificationCoordinator.SoundVolume.allCases.map {
+                             (label: $0.label, tag: $0.rawValue) },
+                         selected: notifications.soundVolume.rawValue,
+                         toolTip: "How loud the \u{201C}Claude is waiting / task finished\u{201D} buzz plays. All three levels are the same sound at low, mid, or high volume.")
+
         // Withdraw a delivered "Claude is waiting" alert once that session resumes
         // after you act. On by default; turn off to keep alerts in Notification
         // Center as a record. ⌥-gated: a set-once toggle, hidden from the common menu.
@@ -456,11 +467,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                          selected: Int(remoteIdleTimeout),
                          toolTip: "Let the Mac sleep after this long with no activity on a remote-controlled session (a turn resets the timer). Off keeps it awake as long as the bridge is connected."))
 
-        // Surface the Claude Code plan limits (the /usage screen). Off by default;
-        // turning it on reads the OAuth token from the Keychain (one-time prompt).
+        // Surface the Claude Code plan limits (the /usage screen). Off by default.
+        // Estimated locally from your JSONL transcripts — no login, no network.
         addToggle(to: menu, title: "Show Plan Usage", action: #selector(togglePlanUsage),
                   on: planLimits.enabled,
-                  toolTip: "Show your Claude Code 5-hour and weekly plan-limit usage, read from your Claude Code login")
+                  toolTip: "Estimate your Claude Code 5-hour and weekly plan-limit usage from your local transcripts (self-calibrated against your own peak)")
 
         addToggle(to: menu, title: "Open at Login", action: #selector(toggleLogin),
                   on: SMAppService.mainApp.status == .enabled)
@@ -699,22 +710,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .ready:
             if let u = planLimits.usage, !u.isEmpty {
                 addPlanPieRows(to: menu, usage: u, tabX: tabX, rowWidth: rowWidth)
-            } else { menu.addItem(planInfoRow("Unavailable", width: rowWidth)) }
-        case .loading:      menu.addItem(planInfoRow("Loading…", width: rowWidth))
-        case .noToken:      menu.addItem(planInfoRow("Sign in to Claude Code first", width: rowWidth))
-        case .unauthorized: menu.addItem(planInfoRow("Reauthorizing…", width: rowWidth))
-        case .rateLimited:  menu.addItem(planInfoRow("Rate-limited — will retry later", width: rowWidth))
-        case .error:        menu.addItem(planInfoRow("Unavailable", width: rowWidth))
-        case .off:          break   // guarded above
+            } else { menu.addItem(planInfoRow("No recent usage", width: rowWidth)) }
+        case .loading: menu.addItem(planInfoRow("Estimating…", width: rowWidth))
+        case .noData:  menu.addItem(planInfoRow("No local transcripts found", width: rowWidth))
+        case .off:     break   // guarded above
         }
     }
 
-    // The "Plan Usage" header — the plan name when known (e.g. "Max (5x) Plan
-    // Usage"), a leading external-link cue, and the "Resets" column header right-
-    // aligned over the values below. A standard clickable item, so it gets the
-    // native hover highlight and opens claude.ai on click.
+    // The "Plan Usage (est.)" header — the "(est.)" flags that these are a local
+    // estimate, not the authoritative /usage numbers — a leading external-link
+    // cue, and the "Resets" column header right-aligned over the values below. A
+    // standard clickable item, so it gets the native hover highlight and opens
+    // claude.ai (the real numbers) on click.
     private func planHeaderItem(tabX: CGFloat) -> NSMenuItem {
-        let title = planLimits.planLabel.map { "\($0) Plan Usage" } ?? "Plan Usage"
+        let title = "Plan Usage (est.)"
         // Show the "Resets" column header only when a reset value sits below it.
         let hasReset = planLimits.usage.map { u in
             [u.fiveHour, u.sevenDay, u.sevenDayOpus, u.sevenDaySonnet].contains { $0?.resetsAt != nil }
@@ -845,8 +854,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             claudeHookStatusText(),
             snap.remoteControlActive ? "Remote Control: Active" : "Remote Control: Off",
             "Kept Awake By",
-            planLimits.planLabel.map { "\($0) Plan Usage" } ?? "Plan Usage",
-            "Force Stay Awake", "Notify When Task Finishes",
+            "Plan Usage (est.)",
+            "Force Stay Awake", "Notify When Task Finishes", "Notification Volume",
             "Clear Notifications When Resumed", "Notification Delay",
             "Remote Idle Timeout", "Show Plan Usage", "Open at Login", "Quit AwakeBar",
         ]
@@ -906,6 +915,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func setGrace(_ sender: NSMenuItem) {
         if notifications.setGrace(TimeInterval(sender.tag)) { render() }
+    }
+
+    @objc private func setVolume(_ sender: NSMenuItem) {
+        guard let level = NotificationCoordinator.SoundVolume(rawValue: sender.tag) else { return }
+        if notifications.setVolume(level) { render() }
     }
 
     // Pick the remote idle timeout. Persists, republishes the window for the hook,

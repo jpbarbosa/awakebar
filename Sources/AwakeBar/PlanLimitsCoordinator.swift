@@ -2,48 +2,45 @@ import Foundation
 
 // MARK: - Plan limits coordinator
 //
-// Owns the lifecycle around PlanLimits: the persisted opt-in, the throttle that
-// keeps the API call rare, the 429 cooldown, and the last-known usage the menu
-// renders. AppDelegate owns one of these (mirroring NotificationCoordinator) and
-// drives it from the same refresh cadence.
+// Owns the lifecycle around the local plan-usage estimate: the persisted opt-in,
+// a throttle that keeps the transcript scan rare, and the last-known usage the
+// menu renders. AppDelegate owns one of these (mirroring NotificationCoordinator)
+// and drives it from the same refresh cadence.
 //
-// Safety lives here, not in the menu: while disabled we touch neither the
-// Keychain nor the network; while enabled we fetch at most once per `minInterval`
-// no matter how often refreshIfDue() is called, and a 429 parks us for a long
-// `cooldown` (the endpoint sends no Retry-After and stays stuck if hammered).
+// This used to guard a Keychain read + `/api/oauth/usage` fetch with a 429
+// cooldown; now there's no auth and no network, so all that's gone. The only cost
+// is reading ~800 JSONL files, so we scan off the main actor and at most once per
+// `minInterval` — the bars move on the scale of hours.
 @MainActor
 final class PlanLimitsCoordinator {
-    // Persisted opt-in. Off by default — enabling it is the user's explicit
-    // consent and the moment the one-time Keychain access prompt appears.
+    // Persisted opt-in. Off by default; the key name is unchanged so anyone who
+    // already enabled the old Keychain-backed panel keeps it enabled.
     private static let enabledKey = "planUsageEnabled"
 
     enum Status: Equatable {
-        case off            // feature disabled
-        case loading        // enabled, no result yet
-        case ready          // have usage to show
-        case noToken        // couldn't find the OAuth token (signed out?)
-        case unauthorized   // token rejected (rotated) — transient
-        case rateLimited    // backing off after a 429
-        case error          // last fetch failed
+        case off        // feature disabled
+        case loading    // enabled, no scan result yet
+        case ready      // have usage to show
+        case noData     // no transcripts found / nothing in the windows
     }
 
     private(set) var usage: PlanLimits.Usage?
-    private(set) var planLabel: String?   // e.g. "Max (5x)", from the credential
     private(set) var status: Status
 
-    // Re-render hook, set by AppDelegate, so an async fetch result repaints the
+    // Re-render hook, set by AppDelegate, so an async scan result repaints the
     // menu the same way a snapshot refresh does.
     var onUpdate: (@MainActor () -> Void)?
 
-    // The data only moves every few hours, so call the API at most this often
-    // even though refreshIfDue() runs on the app's 10s cadence.
-    private let minInterval: TimeInterval = 10 * 60
-    // A 429 has no Retry-After and persists; back off hard rather than retry.
-    private let cooldown: TimeInterval = 45 * 60
+    // Scanning the transcripts is cheap but not free; the bars move slowly, so
+    // recompute at most this often no matter how often refreshIfDue() is called.
+    private let minInterval: TimeInterval = 5 * 60
 
     private var inFlight = false
-    private var lastAttempt: Date?
-    private var cooldownUntil: Date?
+    private var lastScan: Date?
+
+    // ~/.claude/projects — one JSONL file per session.
+    private let projectsDir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".claude/projects", isDirectory: true)
 
     init() {
         status = UserDefaults.standard.bool(forKey: Self.enabledKey) ? .loading : .off
@@ -51,8 +48,8 @@ final class PlanLimitsCoordinator {
 
     var enabled: Bool { status != .off }
 
-    // Flip the feature. On → kick an immediate fetch (and the Keychain prompt);
-    // off → forget the cached usage so nothing lingers in the menu.
+    // Flip the feature. On → kick an immediate scan; off → forget the cached
+    // usage so nothing lingers in the menu.
     func setEnabled(_ on: Bool) {
         UserDefaults.standard.set(on, forKey: Self.enabledKey)
         if on {
@@ -61,53 +58,44 @@ final class PlanLimitsCoordinator {
         } else {
             status = .off
             usage = nil
-            planLabel = nil
-            cooldownUntil = nil
-            lastAttempt = nil
+            lastScan = nil
         }
     }
 
-    // Called on the app's refresh cadence and on menu-open; a no-op unless a
-    // fetch is genuinely due, so the network call stays rare regardless of how
-    // often this fires.
+    // Called on the app's refresh cadence and on menu-open; a no-op unless a scan
+    // is genuinely due, so the file walk stays rare regardless of how often this
+    // fires.
     func refreshIfDue() { refresh(force: false) }
 
     private func refresh(force: Bool) {
         guard enabled, !inFlight else { return }
         let now = Date()
-        if let until = cooldownUntil, now < until { return }
-        if !force, let last = lastAttempt, now.timeIntervalSince(last) < minInterval { return }
+        if !force, let last = lastScan, now.timeIntervalSince(last) < minInterval { return }
 
         inFlight = true
-        lastAttempt = now
-        let userAgent = UsageAPI.userAgent
-        // Detached so the Keychain read + request run off the main actor; the
-        // result is applied back on it.
+        lastScan = now
+        let dir = projectsDir
+        // Detached so the file walk + parse run off the main actor; the result is
+        // applied back on it.
         Task.detached(priority: .utility) {
-            let result = await PlanLimits.fetch(userAgent: userAgent)
-            await MainActor.run { self.apply(result) }
+            let entries = UsageLedger.scan(projectsDir: dir)
+            let usage = UsageLedger.estimate(from: entries, now: Date())
+            await MainActor.run { self.apply(usage, entryCount: entries.count) }
         }
     }
 
-    private func apply(_ result: PlanLimits.FetchResult) {
+    private func apply(_ usage: PlanLimits.Usage, entryCount: Int) {
         inFlight = false
-        switch result {
-        case .ok(let u, let plan):
-            usage = u
-            if let plan { planLabel = plan }   // keep last known across transient errors
-            status = .ready
-            cooldownUntil = nil
-        case .noToken:      status = .noToken
-        case .unauthorized: status = .unauthorized
-        case .rateLimited:
-            status = .rateLimited
-            cooldownUntil = Date().addingTimeInterval(cooldown)
-        case .failed(let why): status = .error
-            NSLog("AwakeBar: plan usage fetch failed — %@", why)
+        if entryCount == 0 {
+            status = .noData
+            self.usage = nil
+        } else {
+            self.usage = usage
+            status = usage.isEmpty ? .noData : .ready
         }
-        // Logs status + utilisations/reset epochs only (see menuSignature) — never
-        // the token. Lets a live run be verified from the unified log.
-        NSLog("AwakeBar: plan usage = %@", menuSignature)
+        // Logs status + utilisations/reset epochs only (see menuSignature) — no
+        // transcript content. Lets a live run be verified from the unified log.
+        NSLog("AwakeBar: plan usage (est) = %@", menuSignature)
         onUpdate?()
     }
 
@@ -119,9 +107,7 @@ final class PlanLimitsCoordinator {
             w.map { "\(Int($0.utilization.rounded()))@\(Int($0.resetsAt?.timeIntervalSince1970 ?? 0))" }
                 ?? "-"
         }
-        let u = usage
-        return [String(describing: status), planLabel ?? "",
-                f(u?.fiveHour), f(u?.sevenDay), f(u?.sevenDayOpus), f(u?.sevenDaySonnet)]
+        return [String(describing: status), f(usage?.fiveHour), f(usage?.sevenDay)]
             .joined(separator: ",")
     }
 }

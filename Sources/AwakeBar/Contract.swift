@@ -59,37 +59,13 @@ enum Contract {
     }
 }
 
-// MARK: - Plan-usage API contract
+// MARK: - Plan-usage web link
 //
-// The undocumented bits AwakeBar needs to read Claude Code's *plan* usage (the
-// `/usage` screen: 5-hour / weekly limit utilisation + reset times). Unlike the
-// hook Contract above this is app↔Anthropic, not app↔hook — so there is NO shell
-// mirror; these literals live only here. Same discipline though: they're an
-// undocumented private interface Claude Code uses for its own `/usage`, so a
-// rename upstream is a one-line fix in this enum. See PlanLimits.swift.
+// Plan usage is now estimated locally from the JSONL transcripts (UsageLedger) —
+// no endpoint, no Keychain token. All that's left here is where the menu's
+// "Plan Usage" header sends you for the authoritative numbers on the web.
 enum UsageAPI {
-    // Read-only usage endpoint that backs Claude Code's `/usage`. We hit this and
-    // never `/v1/messages` — it spends no generation quota and returns every bar.
-    static let endpoint = URL(string: "https://api.anthropic.com/api/oauth/usage")!
-
     // Where the "Plan Usage" header links — the plan-usage page on the web.
     // Best-guess deep link; adjust here if Anthropic moves the settings path.
     static let webUsageURL = URL(string: "https://claude.ai/settings/usage")!
-
-    // The OAuth token lives in the login Keychain under this generic-password
-    // service, stored as a JSON blob ({ claudeAiOauth: { accessToken, … } }).
-    static let keychainService = "Claude Code-credentials"
-
-    // Headers that make the request look like Claude Code's own usage check.
-    // The beta opts the OAuth token into the messages/usage surface; the
-    // User-Agent is load-bearing — without a `claude-code/<ver>` UA the endpoint
-    // drops you into an aggressively rate-limited bucket that 429s for 30+ min.
-    static let betaHeader = "oauth-2025-04-20"
-
-    // Track the installed Claude Code version when it drifts; only the
-    // `claude-code/` prefix is what keeps us out of the punitive bucket, so an
-    // approximate version is fine. (Follow-up: read it from the newest transcript's
-    // `version` field instead of hardcoding.)
-    static let clientVersion = "2.1.157"
-    static var userAgent: String { "claude-code/\(clientVersion)" }
 }

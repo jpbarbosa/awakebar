@@ -1,6 +1,6 @@
 # AwakeBar — Usage Metrics Plan
 
-**Status:** Panel 2 implemented (behind a flag) · Panel 1 deferred · **Created:** 2026-06-01
+**Status:** Plan Usage shipped as a **local estimate** (behind a flag) · **Created:** 2026-06-01 · **Pivoted:** 2026-06-06
 **Owner:** JP · **Scope:** add usage metrics to the menu bar in two independent panels.
 
 > **Decision (2026-06-01):** build **Panel 2** first (the actionable plan-limit
@@ -11,6 +11,18 @@
 > `/usage` screen once, and confirm the exact per-model bucket keys / the
 > Keychain blob shape on the first real response (the decoder is written to be
 > lenient about both until then).
+>
+> **Pivot (2026-06-06):** Panel 2's `/api/oauth/usage` path was **replaced by a
+> local estimate** (`UsageLedger.swift`). The Keychain access prompt that gates
+> the OAuth token wouldn't stay granted under heavy concurrent-session use, and
+> the only other local source of the exact numbers — the status line's
+> `rate_limits` — is never emitted in the VSCode extension's headless
+> (`stream-json`) mode. So Panel 2 became a **merge of Panels 1 and 2**: it reads
+> the JSONL transcripts (Panel 1's source) and derives self-calibrated 5h/weekly
+> bars from cost, labelled **(est.)**. `PlanLimits.swift` shrank to shared
+> types + formatting; the Keychain/network/429-cooldown code and the `decode`/
+> `credential`/`planLabel` helpers (and their tests) are gone. The exact `/usage`
+> API findings below are kept for history but are no longer wired up.
 
 Background research is captured inline so this doc stands alone. See also
 [CLAUDE.md](CLAUDE.md), [DESIGN.md](DESIGN.md).

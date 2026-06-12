@@ -91,27 +91,26 @@ removing the hooks or via **System Settings ▸ Notifications**. See
 
 ## Plan usage
 
-Turn on **Show Plan Usage** to mirror Claude Code's `/usage` screen in the menu —
-how much of your plan you've burned and when each window resets:
+Turn on **Show Plan Usage** for an at-a-glance estimate of how much of your plan
+you've burned and when each window resets:
 
-- **Session** — your 5-hour rolling window (e.g. `53% · in 2h 34m`).
-- **Weekly** — the all-models weekly limit (e.g. `23% · Sat 07:00`), plus a
-  per-model row (e.g. **Weekly · Sonnet**) when you've used that model.
+- **Session** — your trailing 5-hour window (e.g. `53% · in 2h 34m`).
+- **Weekly** — your trailing 7-day window (e.g. `23% · Sat 07:00`).
 
 Each row carries a small pie that fills as the window does and **turns red past
-75%**, so a glance tells you how close you are. The header names your plan
-(**Max (5x) Plan Usage**) and links to your usage page on the web.
+75%**. The header — **Plan Usage (est.)** — links to your real usage page on the
+web. Reset times follow your Mac's clock format (12-/24-hour) and locale; the
+numbers update on a slow cadence — this is a glance, not a live dashboard.
 
-Reset times follow your Mac's clock format (12-/24-hour) and locale. The numbers
-update on a slow cadence — this is a glance, not a live dashboard.
-
-**Off by default**, because it reads data the others don't: it reuses your
-existing Claude Code login (the OAuth token in your Keychain) to fetch usage
-straight from Anthropic, so the first time you enable it macOS asks you to allow
-access to the `Claude Code-credentials` keychain item — click **Always Allow**.
-It's read-only, polls infrequently, and spends no message quota; the token never
-leaves your Mac. This uses an undocumented Claude Code interface, so it may need
-an update if Anthropic changes it — see [DESIGN.md](DESIGN.md).
+**It's an estimate** (hence the "est."), computed entirely on your Mac — no
+login, no network, no Keychain prompt. AwakeBar reads Claude Code's own session
+transcripts and self-calibrates: each window's percentage is its usage relative
+to the **biggest same-length window you've ever run**, so it needs no knowledge of
+your exact plan limit. That also means it reads ~100% whenever you set a new
+personal peak, and it can drift from the official `/usage` number — open the
+header link for the authoritative figure. **Off by default.** See
+[DESIGN.md](DESIGN.md) for the cost model and why it's an estimate rather than the
+exact numbers.
 
 ## Install the hooks
 

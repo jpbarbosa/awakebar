@@ -39,20 +39,47 @@ PLIST
 mkdir -p "$APP/Contents/Resources"
 cp icon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
+# Bundle the notification "buzz" sound. The app plays it with AVAudioPlayer (not
+# UNNotificationSound, which has no volume API), so the menu's Notification Volume
+# Low/Mid/High can scale playback of this one file.
+cp sound/buzz.aiff "$APP/Contents/Resources/buzz.aiff"
+
 # Sign with a code-signing identity discovered from the local keychain, so
 # rebuilds keep a stable signature (login-item registration and granted
 # permissions survive). Nothing personal is hardcoded; falls back to ad-hoc
 # when no identity is installed.
-SIGN_ID=$(security find-identity -v -p codesigning \
-    | grep -m1 -E 'Apple Development|Developer ID Application' \
-    | grep -o '[0-9A-F]\{40\}' || true)
+#
+# This signature is load-bearing for the Plan Usage feature: macOS pins the
+# "Always Allow" grant on the Claude Code-credentials keychain item to the app's
+# designated requirement, so a signature that drifts between builds is exactly
+# what makes that password prompt come back. Two drift sources are closed here:
+#   * Identity is chosen deterministically (Developer ID first, then Apple
+#     Development) instead of relying on `find-identity` output order, so a
+#     machine with more than one identity can't flip between builds.
+#   * The ad-hoc fallback — whose signature changes every build and therefore
+#     cannot hold a grant — now warns loudly instead of failing silently.
+IDENTITIES=$(security find-identity -v -p codesigning || true)
+SIGN_ID=$(printf '%s\n' "$IDENTITIES" | grep -m1 'Developer ID Application' | grep -o '[0-9A-F]\{40\}' || true)
+[ -n "$SIGN_ID" ] || SIGN_ID=$(printf '%s\n' "$IDENTITIES" | grep -m1 'Apple Development' | grep -o '[0-9A-F]\{40\}' || true)
 if [ -n "$SIGN_ID" ]; then
     codesign --force --options runtime --sign "$SIGN_ID" "$APP"
-    echo "Built ./$APP (signed with a local identity)"
+    echo "Built ./$APP (signed with a stable local identity)"
 else
     codesign --force --sign - "$APP"
-    echo "Built ./$APP (ad-hoc — no signing identity found)"
+    cat >&2 <<'WARN'
+WARNING: built ad-hoc — no Developer ID / Apple Development identity found.
+         An ad-hoc signature changes on every build, so the macOS "Always Allow"
+         grant for Plan Usage (the Claude Code-credentials keychain item) will
+         NOT persist — the password prompt returns after each rebuild. Install a
+         free Apple Development certificate (Xcode ▸ Settings ▸ Accounts) and
+         rebuild to make the grant stick.
+WARN
 fi
+
+# Echo the designated requirement we just signed against — this is precisely
+# what the keychain ACL pins "Always Allow" to. Stable across builds ⇒ the Plan
+# Usage prompt appears once and never again.
+codesign -dr - "$APP" 2>&1 | sed -n 's/^designated => /  designated requirement → /p' || true
 
 # Refresh the LaunchServices registration so Finder / `open` pick up the
 # freshly rebuilt bundle instead of a stale cached copy (which can make the
