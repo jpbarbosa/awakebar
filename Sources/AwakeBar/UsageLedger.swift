@@ -5,12 +5,13 @@ import Foundation
 // Estimates the 5-hour and weekly plan-limit bars from Claude Code's *own* JSONL
 // transcripts in `~/.claude/projects/**/*.jsonl` — the same files `ccusage`
 // reads — so the menu needs no OAuth token, no Keychain prompt, and no network.
-// This replaced the `/api/oauth/usage` path: that endpoint is exact but the only
-// way to reach it is the Keychain token, and reading another app's Keychain item
-// triggers a macOS password prompt that won't stay granted under heavy
-// concurrent-session use. The transcripts cost nothing to read and work in the
-// VSCode extension (which runs Claude headless, so its status line — the other
-// local source of these numbers — never renders).
+// This is the default and the fallback. The exact `/api/oauth/usage` numbers are
+// available too, behind "Connect Claude Account…" (see UsageOAuth) — but that
+// needs a login, so the estimate is what shows until you connect (and what we
+// fall back to if a grant dies). We don't read *Claude Code's* Keychain token for
+// it: that re-prompts on every rotation; UsageOAuth runs our own login instead.
+// The transcripts also work in the VSCode extension (which runs Claude headless,
+// so its status line — the other local source of these numbers — never renders).
 //
 // The catch: Anthropic's real limit is in opaque internal units we can't compute
 // locally. So instead of a published denominator we **self-calibrate** — a

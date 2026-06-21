@@ -41,9 +41,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // logic lives here, lifted out of this controller.
     private let notifications = NotificationCoordinator()
 
-    // Optional "Plan usage" panel — the /usage limits, fetched from Claude Code's
-    // OAuth token. Off by default; owns its own throttle/cooldown so the menu code
-    // stays unaware of the network underneath.
+    // Optional "Plan usage" panel — the /usage limits. Estimated locally by
+    // default; "Connect Claude Account…" upgrades it to the exact numbers via
+    // AwakeBar's own OAuth login. Off by default; owns its own throttle/cooldown
+    // so the menu code stays unaware of the scan/network underneath.
     private let planLimits = PlanLimitsCoordinator()
 
     // How long a remote-controlled session may stay idle (no prompt/tool/stop
@@ -711,10 +712,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let u = planLimits.usage, !u.isEmpty {
                 addPlanPieRows(to: menu, usage: u, tabX: tabX, rowWidth: rowWidth)
             } else { menu.addItem(planInfoRow("No recent usage", width: rowWidth)) }
-        case .loading: menu.addItem(planInfoRow("Estimating…", width: rowWidth))
-        case .noData:  menu.addItem(planInfoRow("No local transcripts found", width: rowWidth))
+        case .loading:
+            menu.addItem(planInfoRow(planLimits.connected ? "Fetching…" : "Estimating…", width: rowWidth))
+        case .noData:
+            menu.addItem(planInfoRow(planLimits.connected ? "No usage to show yet"
+                                                          : "No local transcripts found", width: rowWidth))
         case .off:     break   // guarded above
         }
+        addPlanAccountItem(to: menu)
+    }
+
+    // The connect/disconnect action under the plan rows: "Connect Claude Account…"
+    // upgrades the estimate to the exact /usage numbers (its own OAuth login, see
+    // PlanLimitsCoordinator); once connected it becomes "Disconnect", which reverts
+    // to the estimate. A standard item, so it takes the native hover highlight, with
+    // its glyph in the shared leading slot to line up with the rows above.
+    private func addPlanAccountItem(to menu: NSMenu) {
+        let item: NSMenuItem
+        if planLimits.connected {
+            item = NSMenuItem(title: "Disconnect Claude Account",
+                              action: #selector(disconnectClaudeAccount), keyEquivalent: "")
+            item.image = leadingSlot(NSImage(systemSymbolName: "person.crop.circle.badge.xmark",
+                accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 12, weight: .regular)),
+                template: true)
+            item.toolTip = "Stop fetching the exact numbers and revert to the local estimate"
+        } else {
+            item = NSMenuItem(title: planLimits.needsReauth ? "Reconnect Claude Account…"
+                                                            : "Connect Claude Account…",
+                              action: #selector(connectClaudeAccount), keyEquivalent: "")
+            item.image = leadingSlot(NSImage(systemSymbolName: "person.crop.circle.badge.plus",
+                accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 12, weight: .regular)),
+                template: true)
+            item.toolTip = "Sign in to show your exact Claude plan usage instead of the local estimate"
+        }
+        item.target = self
+        menu.addItem(item)
     }
 
     // The "Plan Usage (est.)" header — the "(est.)" flags that these are a local
@@ -723,7 +755,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // standard clickable item, so it gets the native hover highlight and opens
     // claude.ai (the real numbers) on click.
     private func planHeaderItem(tabX: CGFloat) -> NSMenuItem {
-        let title = "Plan Usage (est.)"
+        // "(est.)" only while we're showing the local estimate; a connected live
+        // fetch drops it, since those are the authoritative numbers.
+        let title = planLimits.showingEstimate ? "Plan Usage (est.)" : "Plan Usage"
         // Show the "Resets" column header only when a reset value sits below it.
         let hasReset = planLimits.usage.map { u in
             [u.fiveHour, u.sevenDay, u.sevenDayOpus, u.sevenDaySonnet].contains { $0?.resetsAt != nil }
@@ -854,7 +888,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             claudeHookStatusText(),
             snap.remoteControlActive ? "Remote Control: Active" : "Remote Control: Off",
             "Kept Awake By",
-            "Plan Usage (est.)",
+            "Plan Usage (est.)", "Connect Claude Account…", "Disconnect Claude Account",
             "Force Stay Awake", "Notify When Task Finishes", "Notification Volume",
             "Clear Notifications When Resumed", "Notification Delay",
             "Remote Idle Timeout", "Show Plan Usage", "Open at Login", "Quit AwakeBar",
@@ -876,6 +910,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func togglePlanUsage() {
         planLimits.setEnabled(!planLimits.enabled)
+        render()
+    }
+
+    // Start the OAuth login: open the consent page, then collect the pasted
+    // "code#state" in a modal. The exchange runs async; on failure we surface the
+    // reason, and either way re-render so the menu reflects the new state.
+    @objc private func connectClaudeAccount() {
+        NSWorkspace.shared.open(planLimits.beginConnect())
+
+        let alert = NSAlert()
+        alert.messageText = "Connect your Claude account"
+        alert.informativeText = "Claude opened an authorization page in your browser. Approve access, copy the code it shows, and paste it below."
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        field.placeholderString = "Paste the authorization code"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let pasted = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !pasted.isEmpty else { return }
+        planLimits.completeConnect(pastedCode: pasted) { [weak self] result in
+            if case .failure(let error) = result {
+                let a = NSAlert()
+                a.messageText = "Couldn't connect"
+                a.informativeText = error.localizedDescription
+                a.runModal()
+            }
+            self?.render()
+        }
+        render()
+    }
+
+    @objc private func disconnectClaudeAccount() {
+        planLimits.disconnect()
         render()
     }
 

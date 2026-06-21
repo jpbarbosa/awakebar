@@ -59,13 +59,49 @@ enum Contract {
     }
 }
 
-// MARK: - Plan-usage web link
+// MARK: - Plan-usage sources (web link + the live OAuth endpoint)
 //
-// Plan usage is now estimated locally from the JSONL transcripts (UsageLedger) —
-// no endpoint, no Keychain token. All that's left here is where the menu's
-// "Plan Usage" header sends you for the authoritative numbers on the web.
+// Two ways the menu surfaces plan usage:
+//   • UsageLedger — the local estimate from the JSONL transcripts (no auth).
+//   • The live `/api/oauth/usage` endpoint below — the exact `/usage` numbers,
+//     reached with a token AwakeBar mints via its OWN OAuth login (UsageOAuth).
+//
+// The OAuth literals live here as the single Swift-side source of truth, the way
+// Contract centralises the hook literals. They're reverse-engineered (Anthropic
+// doesn't document `/api/oauth/usage`) so a drift is a one-line fix here.
 enum UsageAPI {
     // Where the "Plan Usage" header links — the plan-usage page on the web.
     // Best-guess deep link; adjust here if Anthropic moves the settings path.
     static let webUsageURL = URL(string: "https://claude.ai/settings/usage")!
+
+    // MARK: OAuth (the live source)
+    //
+    // We reuse Claude Code's *public* OAuth client id but run our own PKCE login
+    // and store our own token (see UsageOAuth / TokenStore) — AwakeBar never reads
+    // `Claude Code-credentials`, so there's no macOS Keychain prompt and no
+    // token-rotation race (the reason the old Keychain path was dropped).
+    static let oauthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+    static let oauthAuthorizeURL = URL(string: "https://claude.ai/oauth/authorize")!
+    // Manual copy/paste callback: the consent page shows a "code#state" string the
+    // user pastes back. Must match byte-for-byte in the token exchange.
+    static let oauthRedirectURI = "https://console.anthropic.com/oauth/code/callback"
+    static let oauthScope = "org:create_api_key user:profile user:inference"
+    // The token endpoint. `api.anthropic.com/v1/oauth/token` is the live one (same
+    // host as the usage GET; verified returning RFC-6749 `invalid_grant` for a bad
+    // code). `console.anthropic.com/v1/oauth/token` — what the older references use
+    // — now 404s. Tried in order, so a host flip doesn't break login/refresh.
+    static let oauthTokenURLs = [
+        URL(string: "https://api.anthropic.com/v1/oauth/token")!,
+        URL(string: "https://platform.claude.com/v1/oauth/token")!,
+    ]
+    static let oauthBetaHeader = "oauth-2025-04-20"
+    // Sent on the usage GET; mimics the real client to dodge aggressive 429s.
+    static let usageUserAgent = "claude-code/2.1.181"
+
+    // The endpoint backing `/usage`. Bearer token + the beta header above.
+    static let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
+
+    // The Keychain generic-password service AwakeBar stores ITS OWN token under —
+    // deliberately not "Claude Code-credentials", so we own the item's ACL.
+    static let oauthKeychainService = "io.jp7.awakebar.oauth"
 }

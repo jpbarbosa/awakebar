@@ -16,7 +16,8 @@ Product docs: [README.md](README.md). Mechanics & rationale: [DESIGN.md](DESIGN.
 - `Contract.swift` — the single source of truth for the hook IPC: the `/tmp`
   marker paths, VSCode bridge markers, reason tokens, and cwd sanitiser
   (mirrored on the shell side by `claude-hook-contract.sh`). Also holds the
-  app-only `UsageAPI.webUsageURL` (where the plan-usage header links).
+  app-only `UsageAPI` constants: the plan-usage web link plus the OAuth/`/usage`
+  endpoint literals (client id, authorize/token hosts, scope, Keychain service).
 - `AwakeMonitor.swift` — reads `pmset -g assertions` and parses the VSCode
   extension-host log (Remote Control lifecycle + VSCode in-panel permission prompts).
 - `NotificationCoordinator.swift` — owns the "Claude is waiting / task finished /
@@ -28,9 +29,18 @@ Product docs: [README.md](README.md). Mechanics & rationale: [DESIGN.md](DESIGN.
 - `UsageLedger.swift` — *estimates* the plan-usage bars locally from the JSONL
   transcripts (`~/.claude/projects/**/*.jsonl`): scan + dedup + per-model cost
   model + a self-calibrated 5h/weekly window. No OAuth token, no network. Pure
-  `cost`/`parse`/`estimate`/`rollingPeak` are tested.
-- `PlanLimitsCoordinator.swift` — owns the plan-usage opt-in flag, the scan
-  throttle, and the last-known usage the menu renders.
+  `cost`/`parse`/`estimate`/`rollingPeak` are tested. This is the fallback / the
+  only source until you connect.
+- `UsageOAuth.swift` — the *live* source: AwakeBar's own OAuth PKCE login (reusing
+  Claude Code's public client id) and the `/api/oauth/usage` fetch behind the exact
+  `/usage` numbers. Pure `base64URL`/`challenge`/`pkce`/`authorizeURL`/`splitCode`/
+  `decodeToken`/`decodeUsage` are tested; the URLSession calls + `runLive` are IO.
+- `TokenStore.swift` — persists the OAuth token in AwakeBar's *own* Keychain item
+  (`UsageAPI.oauthKeychainService`, NOT `Claude Code-credentials`), so reads never
+  prompt.
+- `PlanLimitsCoordinator.swift` — owns the plan-usage opt-in flag, the connect/
+  disconnect flow, the scan + live-fetch throttle (incl. a 429 cooldown), and the
+  last-known usage the menu renders (live preferred, estimate as fallback).
 - `AppDelegate.swift` — menu UI, power assertions, and the refresh loop; owns a
   `NotificationCoordinator` and a `PlanLimitsCoordinator`.
 - `main.swift` — entry point.
@@ -50,17 +60,25 @@ Apple's SF Symbols licence bars its symbols from app icons.
 - **cwd parse anchor.** Only trust `launch_claude` / `Spawning Claude` lines for
   a session's cwd; the log also echoes back tool inputs that mention `cwd:` —
   don't match those.
-- **Plan-usage bars are a local estimate, not the real `/usage` numbers.**
-  `UsageLedger` reads the JSONL transcripts and self-calibrates: a window's
-  utilisation is its cost as a fraction of the largest same-length window in your
-  whole history. So it needs no published limit, but it's approximate and reads
-  100% whenever you set a new peak — hence the menu's "(est.)". We went this way
-  because the exact source (`/api/oauth/usage`) needs the Keychain OAuth token,
-  whose macOS access prompt won't stay granted under heavy concurrent-session
-  use, and the only other local source (the status line's `rate_limits`) is never
-  emitted in the VSCode extension's headless/stream-json mode. Cost is the
-  limit-unit proxy (a cache read weighs ~1/10th of fresh input); prices live in
-  `UsageLedger.prices`. Off by default.
+- **Plan-usage has two sources; the estimate is the default, the live OAuth one
+  is the upgrade.** The default `UsageLedger` estimate reads the JSONL transcripts
+  and self-calibrates: a window's utilisation is its cost as a fraction of the
+  largest same-length window in your whole history. Approximate, reads 100% on a
+  new peak — hence "(est.)". Cost is the limit-unit proxy (a cache read weighs
+  ~1/10th of fresh input); prices live in `UsageLedger.prices`. "Connect Claude
+  Account…" upgrades it to the exact numbers from `/api/oauth/usage` (header drops
+  the "(est.)", per-model weekly rows appear). Off by default.
+- **Why the live path is our *own* OAuth login, not Claude Code's token.** Reading
+  `Claude Code-credentials` re-prompts on every token rotation (Claude Code
+  delete+recreates the item, wiping our ACL grant). So `UsageOAuth` runs an
+  independent PKCE login and `TokenStore` keeps our own Keychain item — no prompt,
+  no rotation race (this is how CodeQuota coexists with Claude Code). The endpoint
+  is **undocumented/reverse-engineered** (Anthropic disowns it) and 429-prone, so
+  it's polled ≥5 min, keeps last-good on 429/offline, and degrades to the estimate
+  if a grant dies — a break never blanks the panel. The statusLine `rate_limits`
+  block (the clean official source) stays unusable here: it isn't emitted in the
+  VSCode extension / headless stream-json mode (verified — a successful headless
+  turn invokes the statusLine 0×; CC issues #55643, #58071).
 
 ## Hook ↔ app IPC (`/tmp`)
 
