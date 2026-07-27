@@ -74,6 +74,15 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
     // age-sweep staleVSCodeAlertAge applies to prompts that never log a resolve.
     private static let staleDoneAlertAge: TimeInterval = 5 * 60
 
+    // The same escape hatch for a *waiting* alert. clearResumedByCwd only fires when
+    // that cwd's activity marker passes the event ts, so a session you simply walked
+    // away from never bumps it and its banner used to sit in Notification Center
+    // forever (seen 2026-07-27: a ci-php7 alert still on screen 12 hours later).
+    // Longer leash than staleDoneAlertAge because the two signals age differently: a
+    // "Task finished" banner has already told you everything it can, while a waiting
+    // alert is still actionable if you come back to that session in twenty minutes.
+    private static let staleAttentionAlertAge: TimeInterval = 30 * 60
+
     // VSCode permission prompts surfaced via the extension log (see AwakeMonitor).
     // appLaunch floors out events logged before launch; lastVSNotify is the
     // per-project high-water of handled events so none is alerted twice.
@@ -285,17 +294,12 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
         // prompt / resumed the session), withdraw the banner.
         clearResumedByCwd(&attention.delivered)
         clearResumedByCwd(&done.delivered)
-        // ...but a finished task is one you may never return to, so that resume may
-        // never come. Sweep any done banner that has simply aged past
-        // staleDoneAlertAge so completed-task FYIs don't pile up unanswered.
-        let doneCut = Int(Date().timeIntervalSince1970 - Self.staleDoneAlertAge)
-        for (cwd, entries) in done.delivered {
-            let stale = entries.filter { $0.ts < doneCut }
-            guard !stale.isEmpty else { continue }
-            sink.withdraw(stale.map(\.id))
-            let rest = entries.filter { $0.ts >= doneCut }
-            done.delivered[cwd] = rest.isEmpty ? nil : rest
-        }
+        // ...but that resume may never come, for either kind: a finished task is one
+        // you may never return to, and a waiting alert can belong to a session you
+        // simply abandoned. Sweep both by age so neither can strand a banner in
+        // Notification Center with no signal left that could ever clear it.
+        sweepAged(&done.delivered, olderThan: Self.staleDoneAlertAge)
+        sweepAged(&attention.delivered, olderThan: Self.staleAttentionAlertAge)
         // VSCode permission alerts that never showed resolved (denied/ignored
         // prompts log no resolve marker) would otherwise linger forever once their
         // event ages out of the freshness window. Sweep those stale banners by age.
@@ -319,6 +323,23 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
             guard !resumed.isEmpty else { continue }
             sink.withdraw(resumed.map(\.id))
             let rest = entries.filter { activity <= $0.ts }
+            map[cwd] = rest.isEmpty ? nil : rest
+        }
+    }
+
+    // Withdraw and forget every delivered alert whose event is older than `age`,
+    // whether or not its session ever resumed — the backstop for the sessions that
+    // never send the resume signal clearResumedByCwd waits on. Shared by the waiting
+    // and task-finished maps (see clearResumedAttentions); the VSCode map keeps its
+    // own Date-keyed twin inline there.
+    private func sweepAged(_ map: inout [String: [(id: String, ts: Int)]],
+                           olderThan age: TimeInterval) {
+        let cut = Int(Date().timeIntervalSince1970 - age)
+        for (cwd, entries) in map {
+            let stale = entries.filter { $0.ts < cut }
+            guard !stale.isEmpty else { continue }
+            sink.withdraw(stale.map(\.id))
+            let rest = entries.filter { $0.ts >= cut }
             map[cwd] = rest.isEmpty ? nil : rest
         }
     }
@@ -481,12 +502,17 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
     // Show the banner even though AwakeBar is an accessory (LSUIElement) app, and
     // bring VSCode forward when the banner is clicked. Both are nonisolated to
     // satisfy the protocol; UI work hops to the main actor.
+    //
+    // .list matters as much as .banner: without it a notification presented while
+    // AwakeBar is frontmost shows its banner and is then gone, never filed in
+    // Notification Center — which quietly defeats the threadIdentifier grouping
+    // postAttentionNotification sets up.
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler:
             @escaping (UNNotificationPresentationOptions) -> Void) {
-        completionHandler([.banner, .sound])
+        completionHandler([.banner, .list, .sound])
     }
 
     nonisolated func userNotificationCenter(

@@ -160,6 +160,33 @@ struct NotificationCoordinatorTests {
         #expect(rec.withdrawn == ["claude-attention-100"])
     }
 
+    @Test func staleWaitingAlertSweptEvenWithoutResume() {
+        let rec = Recorder(), sched = CaptureScheduler()
+        let marker = tempFile(), oldCwd = tempCwd(), freshCwd = tempCwd()
+        defer { clean(marker, Contract.activityMarkerPath(forCwd: oldCwd),
+                      Contract.activityMarkerPath(forCwd: freshCwd)) }
+        let c = makeCoordinator(rec, sched, attention: marker, done: tempFile())
+        normalize(c, autoClear: true, notifyDone: true)
+
+        // Two blocked sessions, neither ever resumed (no activity marker) — the exact
+        // shape that used to strand a waiting banner forever, since clearResumedByCwd
+        // waits on a bump that never comes. Events only ever increase in ts, so the
+        // aged one is delivered first: a day-old wait, then a just-now wait elsewhere.
+        let now = Int(Date().timeIntervalSince1970)
+        let old = now - 24 * 60 * 60
+        writeMarker(marker, project: "old", message: "m", cwd: oldCwd, ts: old)
+        c.handleAttention(); sched.fireDue()
+        sched.items.removeAll()   // a real asyncAfter queue drains the fired item
+        writeMarker(marker, project: "fresh", message: "m", cwd: freshCwd, ts: now)
+        c.handleAttention(); sched.fireDue()
+        #expect(rec.postedIds == ["claude-attention-\(old)", "claude-attention-\(now)"])
+
+        // One sweep withdraws only the aged banner; the fresh one stays (its session
+        // may still resume, or it'll age out on a later pass).
+        c.clearResumedAttentions()
+        #expect(rec.withdrawn == ["claude-attention-\(old)"])
+    }
+
     // MARK: done path
 
     @Test func taskFinishedFiresOnlyForRealTasks() {
