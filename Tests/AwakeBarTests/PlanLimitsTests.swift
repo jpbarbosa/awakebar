@@ -2,9 +2,9 @@ import Testing
 import Foundation
 @testable import AwakeBar
 
-// Unit tests for the pure date/formatting helpers PlanLimits still owns. The
-// numbers themselves are produced by UsageLedger (see UsageLedgerTests); these
-// just cover the shared countdown + timestamp parsing the menu renders with.
+// Unit tests for the pure date/formatting helpers PlanLimits owns. The numbers
+// themselves come from `/api/oauth/usage` (see UsageOAuthTests); these cover the
+// countdown and the `resets_at` parsing the menu renders with.
 
 // MARK: - countdown
 
@@ -41,12 +41,8 @@ import Foundation
         #expect(PlanLimits.parseDate("not a date") == nil)
     }
 
-    // The cases below pin the hand-rolled UTC fast path against the
-    // ISO8601DateFormatter it bypasses — the two must not drift apart.
-
-    @Test func fastPathAgreesWithTheFormatter() {
-        // Fractional digits are weighted, not just counted, and the epoch/civil
-        // arithmetic has to survive leap years and century boundaries.
+    @Test func parsesToTheRightInstant() {
+        // Absolute values, so a formatter option change can't silently shift them.
         let cases: [(String, TimeInterval)] = [
             ("1970-01-01T00:00:00Z",     0),
             ("2000-01-01T00:00:00Z",     946_684_800),
@@ -62,8 +58,7 @@ import Foundation
         }
     }
 
-    @Test func fallsBackToTheFormatterForNonUTCOffsets() {
-        // The fast path only accepts a trailing `Z`; this shape must still parse.
+    @Test func parsesNumericOffsetsNotJustZ() {
         let offset = PlanLimits.parseDate("2026-06-01T06:59:00+02:00")
         #expect(offset == PlanLimits.parseDate("2026-06-01T04:59:00Z"))
     }
@@ -72,7 +67,7 @@ import Foundation
         for bad in ["2026-13-01T00:00:00Z",   // month
                     "2026-06-01T25:00:00Z",   // hour
                     "2026-06-01T06:70:00Z",   // minute
-                    "2026-06-01T06:59:60Z",   // leap second — formatter rejects it too
+                    "2026-06-01T06:59:60Z",   // leap second
                     "2026-06-01T06:59:00",    // no zone
                     "2026-06-01T06:59:00.xxZ",
                     "2026-06-01X06:59:00Z"] {

@@ -26,12 +26,7 @@ Product docs: [README.md](README.md). Mechanics & rationale: [DESIGN.md](DESIGN.
 - `AttentionWatcher.swift` — kqueue watcher over a `/tmp/claude-*.json` marker; fires a callback when it changes.
 - `PlanLimits.swift` — the shared plan-usage value types (`Window`/`Usage`) plus
   the pure, tested `countdown`/`parseDate` helpers the menu renders with.
-- `UsageLedger.swift` — *estimates* the plan-usage bars locally from the JSONL
-  transcripts (`~/.claude/projects/**/*.jsonl`): scan + dedup + per-model cost
-  model + a self-calibrated 5h/weekly window. No OAuth token, no network. Pure
-  `cost`/`parse`/`estimate`/`rollingPeak` are tested. This is the fallback / the
-  only source until you connect.
-- `UsageOAuth.swift` — the *live* source: AwakeBar's own OAuth PKCE login (reusing
+- `UsageOAuth.swift` — the only source: AwakeBar's own OAuth PKCE login (reusing
   Claude Code's public client id) and the `/api/oauth/usage` fetch behind the exact
   `/usage` numbers. Pure `base64URL`/`challenge`/`pkce`/`authorizeURL`/`splitCode`/
   `decodeToken`/`decodeUsage` are tested; the URLSession calls + `runLive` are IO.
@@ -39,8 +34,8 @@ Product docs: [README.md](README.md). Mechanics & rationale: [DESIGN.md](DESIGN.
   (`UsageAPI.oauthKeychainService`, NOT `Claude Code-credentials`), so reads never
   prompt.
 - `PlanLimitsCoordinator.swift` — owns the plan-usage opt-in flag, the connect/
-  disconnect flow, the scan + live-fetch throttle (incl. a 429 cooldown), and the
-  last-known usage the menu renders (live preferred, estimate as fallback).
+  disconnect flow, the fetch throttle (incl. a 429 cooldown), and the last-known
+  usage the menu renders.
 - `AppDelegate.swift` — menu UI, power assertions, and the refresh loop; owns a
   `NotificationCoordinator` and a `PlanLimitsCoordinator`.
 - `main.swift` — entry point.
@@ -60,25 +55,27 @@ Apple's SF Symbols licence bars its symbols from app icons.
 - **cwd parse anchor.** Only trust `launch_claude` / `Spawning Claude` lines for
   a session's cwd; the log also echoes back tool inputs that mention `cwd:` —
   don't match those.
-- **Plan-usage has two sources; the estimate is the default, the live OAuth one
-  is the upgrade.** The default `UsageLedger` estimate reads the JSONL transcripts
-  and self-calibrates: a window's utilisation is its cost as a fraction of the
-  largest same-length window in your whole history. Approximate, reads 100% on a
-  new peak — hence "(est.)". Cost is the limit-unit proxy (a cache read weighs
-  ~1/10th of fresh input); prices live in `UsageLedger.prices`. "Connect Claude
-  Account…" upgrades it to the exact numbers from `/api/oauth/usage` (header drops
-  the "(est.)", per-model weekly rows appear). Off by default.
-- **Why the live path is our *own* OAuth login, not Claude Code's token.** Reading
+- **Plan usage has exactly one source: `/api/oauth/usage`.** Connected → the real
+  `/usage` numbers, including the per-model weekly rows. Not connected → the panel
+  says "Connect to show your usage" and shows nothing. Off by default.
+- **Don't re-add a local estimate.** There was one (`UsageLedger`, priced off the
+  JSONL transcripts, self-calibrated against your historical peak) and it was
+  removed 2026-08-01: both halves of the fraction were guesses, it read 35%/79%
+  where `/usage` said 5%/10%, and the fix needed a weekly-reset phase that exists
+  nowhere on disk — i.e. a setting copied off the very screen it was replacing. It
+  also *was* the app's CPU and memory cost (3 GB corpus, 47 s cold scan). DESIGN.md
+  keeps the full autopsy. Connecting is one browser round-trip and is exact.
+- **Why the token is our *own* OAuth login, not Claude Code's.** Reading
   `Claude Code-credentials` re-prompts on every token rotation (Claude Code
   delete+recreates the item, wiping our ACL grant). So `UsageOAuth` runs an
   independent PKCE login and `TokenStore` keeps our own Keychain item — no prompt,
   no rotation race (this is how CodeQuota coexists with Claude Code). The endpoint
   is **undocumented/reverse-engineered** (Anthropic disowns it) and 429-prone, so
-  it's polled ≥5 min, keeps last-good on 429/offline, and degrades to the estimate
-  if a grant dies — a break never blanks the panel. The statusLine `rate_limits`
-  block (the clean official source) stays unusable here: it isn't emitted in the
-  VSCode extension / headless stream-json mode (verified — a successful headless
-  turn invokes the statusLine 0×; CC issues #55643, #58071).
+  it's polled ≥5 min and keeps last-good on 429/offline — a blip never blanks the
+  panel. The statusLine `rate_limits` block (the clean official source) stays
+  unusable here: it isn't emitted in the VSCode extension / headless stream-json
+  mode (verified — a successful headless turn invokes the statusLine 0×; CC issues
+  #55643, #58071).
 
 ## Hook ↔ app IPC (`/tmp`)
 

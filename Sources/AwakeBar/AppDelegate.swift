@@ -232,31 +232,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func updateButton(awake: Bool) {
         guard let button = statusItem.button else { return }
         let forced = manualAssertion.held
-        if let image = statusImage(awake: awake, forced: forced) {
+        // Badge whenever the panel is on but has no account behind it — asked for
+        // and not delivering. That covers a dead grant, a deliberate disconnect and
+        // never having connected at all; the panel itself is blank in every one of
+        // them, so the icon is the only place that difference is visible.
+        let warn = planLimits.enabled && !planLimits.connected
+        if let image = statusImage(awake: awake, forced: forced, warn: warn) {
             button.image = image
             button.title = ""
         } else {
             // Never leave the item empty (invisible) if SF Symbols fail.
             button.image = nil
-            button.title = awake ? "☕︎" : "Zz"
+            button.title = warn ? "⚠︎" : awake ? "☕︎" : "Zz"
         }
-        button.toolTip = forced ? "Keep awake is on — Mac forced awake"
-                       : awake  ? "Mac is being kept awake"
-                                : "Mac can sleep normally"
+        var tip = forced ? "Keep awake is on — Mac forced awake"
+                : awake  ? "Mac is being kept awake"
+                         : "Mac can sleep normally"
+        if warn {
+            tip += planLimits.needsReauth
+                ? " · Plan usage disconnected — click to reconnect"
+                : " · Plan usage not connected — click to connect"
+        }
+        button.toolTip = tip
     }
 
     // The menu-bar cup. Normally a template image, so it adapts to the menu bar
     // (black/white, inverts when the menu is open). When the manual "Keep
-    // awake" hold is on, a red dot is composited at the bottom-right; that
-    // forces a *non-template* image (template images are drawn monochrome by
-    // the system, which would erase the red), so the cup itself is redrawn in
-    // the menu bar's label colour to still look right.
-    private func statusImage(awake: Bool, forced: Bool) -> NSImage? {
+    // awake" hold is on, a red dot is composited at the bottom-right; when the
+    // plan-usage panel is on with no account connected, an amber warning triangle
+    // is composited at the top-right (the two can show at once). Either badge
+    // forces a *non-template* image (template images are drawn monochrome by the
+    // system, which would erase the colour), so the cup itself is redrawn in the
+    // menu bar's label colour to still look right.
+    private func statusImage(awake: Bool, forced: Bool, warn: Bool) -> NSImage? {
         let symbol = awake ? "cup.and.saucer.fill" : "cup.and.saucer"
         guard let base = NSImage(systemSymbolName: symbol,
                                  accessibilityDescription: "Keep-awake status")
         else { return nil }
-        guard forced else {
+        guard forced || warn else {
             return nudgedDown(base, template: true)
         }
         let size = base.size
@@ -269,14 +282,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             base.draw(in: rect.offsetBy(dx: 0, dy: -iconVerticalNudge))
             NSColor.labelColor.set()
             rect.fill(using: .sourceAtop)
-            // Red badge, tangent to the bottom-right corner.
-            let d = (size.height * 0.46).rounded()
-            NSColor.systemRed.setFill()
-            NSBezierPath(ovalIn: NSRect(x: size.width - d, y: 0, width: d, height: d)).fill()
+            // Red "forced awake" badge, tangent to the bottom-right corner.
+            if forced {
+                let d = (size.height * 0.46).rounded()
+                NSColor.systemRed.setFill()
+                NSBezierPath(ovalIn: NSRect(x: size.width - d, y: 0, width: d, height: d)).fill()
+            }
+            // Amber "not connected" warning, tangent to the top-right corner.
+            if warn { drawWarningBadge(in: size) }
             badged.unlockFocus()
         }
         badged.isTemplate = false
         return badged
+    }
+
+    // The not-connected warning composited on the cup: a filled amber triangle with
+    // a dark exclamation, tangent to the top-right corner — opposite the red
+    // "forced" dot so both can show at once. Hand-drawn (like that dot) to stay
+    // crisp at menu-bar size. The caller has the icon's focus locked.
+    private func drawWarningBadge(in iconSize: NSSize) {
+        let s = (iconSize.height * 0.6).rounded()
+        let box = NSRect(x: iconSize.width - s, y: iconSize.height - s, width: s, height: s)
+        let inset = s * 0.08
+
+        // Rounded-corner triangle, apex up. Filling *and* stroking the same path
+        // with a round line join rounds the corners (a plain fill leaves them sharp).
+        let apex  = NSPoint(x: box.midX,         y: box.maxY - inset)
+        let left  = NSPoint(x: box.minX + inset, y: box.minY + inset)
+        let right = NSPoint(x: box.maxX - inset, y: box.minY + inset)
+        let tri = NSBezierPath()
+        tri.move(to: apex); tri.line(to: right); tri.line(to: left); tri.close()
+        tri.lineJoinStyle = .round
+        tri.lineWidth = s * 0.16
+        NSColor.systemYellow.setFill()
+        NSColor.systemYellow.setStroke()
+        tri.fill(); tri.stroke()
+
+        // Exclamation: a vertical bar above a dot, centred, in fixed dark ink so it
+        // reads on the amber whatever the menu bar's appearance.
+        NSColor.black.setFill()
+        let barW = s * 0.13
+        let barTop = box.maxY - inset - s * 0.24
+        let barBot = box.minY + inset + s * 0.40
+        NSBezierPath(roundedRect: NSRect(x: box.midX - barW / 2, y: barBot,
+                                         width: barW, height: barTop - barBot),
+                     xRadius: barW / 2, yRadius: barW / 2).fill()
+        let dotR = barW * 0.62
+        let dotCY = box.minY + inset + s * 0.25
+        NSBezierPath(ovalIn: NSRect(x: box.midX - dotR, y: dotCY - dotR,
+                                    width: 2 * dotR, height: 2 * dotR)).fill()
     }
 
     // The saucer gives cup.and.saucer a low optical centre, so the glyph reads
@@ -760,11 +814,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let u = planLimits.usage, !u.isEmpty {
                 addPlanPieRows(to: menu, usage: u, tabX: tabX, rowWidth: rowWidth)
             } else { menu.addItem(planInfoRow("No recent usage", width: rowWidth)) }
-        case .loading:
-            menu.addItem(planInfoRow(planLimits.connected ? "Fetching…" : "Estimating…", width: rowWidth))
-        case .noData:
-            menu.addItem(planInfoRow(planLimits.connected ? "No usage to show yet"
-                                                          : "No local transcripts found", width: rowWidth))
+        case .connect: menu.addItem(planInfoRow("Connect to show your usage", width: rowWidth))
+        case .loading: menu.addItem(planInfoRow("Fetching…", width: rowWidth))
+        case .noData:  menu.addItem(planInfoRow("No usage to show yet", width: rowWidth))
         case .off:     break   // guarded above
         }
         addPlanAccountItem(to: menu)
@@ -797,15 +849,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item)
     }
 
-    // The "Plan Usage (est.)" header — the "(est.)" flags that these are a local
-    // estimate, not the authoritative /usage numbers — a leading external-link
-    // cue, and the "Resets" column header right-aligned over the values below. A
-    // standard clickable item, so it gets the native hover highlight and opens
-    // claude.ai (the real numbers) on click.
+    // The "Plan Usage" header — a leading external-link cue, and the "Resets"
+    // column header right-aligned over the values below. A standard clickable item,
+    // so it gets the native hover highlight and opens claude.ai on click.
     private func planHeaderItem(tabX: CGFloat) -> NSMenuItem {
-        // "(est.)" only while we're showing the local estimate; a connected live
-        // fetch drops it, since those are the authoritative numbers.
-        let title = planLimits.showingEstimate ? "Plan Usage (est.)" : "Plan Usage"
+        let title = "Plan Usage"
         // Show the "Resets" column header only when a reset value sits below it.
         let hasReset = planLimits.usage.map { u in
             [u.fiveHour, u.sevenDay, u.sevenDayOpus, u.sevenDaySonnet].contains { $0?.resetsAt != nil }
@@ -936,7 +984,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             claudeHookStatusText(),
             snap.remoteControlActive ? "Remote Control: Active" : "Remote Control: Off",
             "Kept Awake By",
-            "Plan Usage (est.)", "Connect Claude Account…", "Disconnect Claude Account",
+            "Plan Usage", "Connect Claude Account…", "Disconnect Claude Account",
             "Force Stay Awake", "Notify When Task Finishes", "Notification Volume",
             "Clear Notifications When Resumed", "Notification Delay",
             "Remote Idle Timeout", "Show Plan Usage", "Open at Login", "Quit AwakeBar",

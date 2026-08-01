@@ -176,44 +176,62 @@ real one. Granularity is per-window/per-project, not per-pid (one window
 normally drives one session); if the launch line has scrolled out of the log
 tail the entry falls back to a generic "Claude session".
 
-## Plan usage (the optional `/usage` panel — a local estimate)
+## Plan usage (the optional `/usage` panel)
 
-**Show Plan Usage** approximates Claude Code's `/usage` limits in the menu —
-labelled **Plan Usage (est.)** because the numbers are computed locally, not read
-from Anthropic. `UsageLedger` reads Claude Code's own JSONL transcripts
-(`~/.claude/projects/**/*.jsonl`, the same files `ccusage` reads), dedups
-assistant responses by `(message.id, requestId)`, and prices each by its model
-(cache writes ≈1.25× input, cache reads ≈0.1×) to get a per-response cost. Cost
-is the proxy for "limit units" — it tracks the real limit far better than a raw
-token count.
+**Show Plan Usage** mirrors Claude's `/usage` screen in the menu. One source:
+`GET /api/oauth/usage`, the endpoint that screen itself is drawing from, so the
+rows are the real numbers rather than anything derived — including the per-model
+weekly buckets. `PlanLimitsCoordinator` polls it at most every 5 minutes (the
+bars move on the scale of hours, and that is also the endpoint's safe floor), off
+the main actor, keeping the last-good values through a 429 or an outage so a blip
+never blanks the panel. Off by default.
 
-The hard part is the denominator: Anthropic's actual limit is in opaque internal
-units we can't compute. So instead of a published number we **self-calibrate** —
-a window's utilisation is its cost as a fraction of the largest same-length window
-you have ever run (`rollingPeak`). That needs no magic constant and adapts to your
-plan, at the cost of being an estimate that reads 100% the moment you set a new
-peak. Two windows are shown: a trailing 5-hour ("Session") and trailing 7-day
-("Weekly"); the per-model weekly rows stay hidden (local data can't split them).
-A window's reset is when its oldest still-counted response ages out.
+Getting a token is the whole design problem, and there are three ways:
 
-Why an estimate at all, rather than the exact `/usage` numbers? Those have only
-two sources and both are blocked here:
+- **Claude Code's own Keychain item** (`Claude Code-credentials`) — rejected.
+  Reading another app's item triggers a macOS password prompt, and the grant will
+  not stay put: Claude Code delete+recreates the item as it rotates the token,
+  wiping our ACL entry, so the prompt keeps returning.
+- **The status line's `rate_limits` payload** — the clean official local source,
+  but an interactive-TUI feature. The VSCode extension runs Claude headless
+  (`--output-format stream-json`), so the status line, and its `rate_limits`, is
+  never emitted. (Verified: no VSCode session ever fires a configured `statusLine`
+  command. CC issues #55643, #58071.)
+- **Our own OAuth login** — what we do. `UsageOAuth` runs an independent PKCE
+  login against Claude Code's *public* client id and `TokenStore` keeps the result
+  in AwakeBar's own Keychain item, so nothing we hold is subject to another app's
+  rotation. This is how CodeQuota coexists with Claude Code. The endpoint is
+  undocumented and reverse-engineered, so its literals are centralised in
+  `UsageAPI` — a drift is a one-line fix.
 
-- **`GET /api/oauth/usage`** is exact but needs Claude Code's OAuth token from the
-  login Keychain (`Claude Code-credentials`). Reading another app's Keychain item
-  triggers a macOS password prompt whose grant won't stay put under heavy
-  concurrent-session use (Claude Code rewrites the item as it rotates the token),
-  so the prompt keeps returning.
-- **The status line's `rate_limits` payload** carries the same numbers locally,
-  but it's an interactive-TUI feature; the VSCode extension runs Claude headless
-  (`--output-format stream-json`), so the status line — and its `rate_limits` —
-  is never emitted. (Verified: no VSCode session ever fires a configured
-  `statusLine` command.)
+### The local estimate, and why it's gone
 
-Everything fragile stays in `UsageLedger`: the price table is one array, and the
-parse is lenient about token-field spellings. It runs off the main actor and
-scans at most once every 5 minutes (`PlanLimitsCoordinator`), since the bars move
-on the scale of hours. Off by default.
+An earlier version filled the not-connected gap with `UsageLedger`: a local
+estimate priced off Claude Code's JSONL transcripts, self-calibrated against the
+largest same-length window in your history since Anthropic's real limit is in
+opaque internal units. It was removed, and it is worth recording why, because the
+idea is tempting enough to come back.
+
+It could not be made to agree with `/usage`, only to hover near it. Both halves
+of the fraction were guesses. The **denominator** was your own historical peak, so
+it read ~100% whenever you set a new one and was ~1.7× off on a real corpus. The
+**numerator** was worse: it measured trailing windows where `/usage` measures
+anchored ones — a 5-hour block that opens on your first message, a weekly period
+on a fixed schedule. For anyone who works most days a trailing window is always
+full, so the bar sat pinned near its peak and its reset read *now*, permanently,
+which is indistinguishable from a frozen panel. On a real corpus trailing said
+35% / 79% where `/usage` said 5% / 10%.
+
+Anchoring fixed most of that — the 5-hour boundary is recoverable by replaying
+Anthropic's block rule over the transcripts, landing within 3 minutes of the real
+one — but the weekly period's *phase* is nowhere on disk: no transcript, and
+nothing else under `~/.claude`, records when your week rolls over. That left a
+setting for the user to copy off the very screen the panel was trying to replace,
+to power numbers that were still a few points out. Connecting an account is one
+browser round-trip and makes all of it exact. The scan was also the app's entire
+CPU and memory cost — a 3 GB corpus, ~250k usage lines, a 47-second cold pass —
+so removing it took the incremental-scan cache, its `(mtime, size)` bookkeeping
+and a hand-rolled ISO-8601 fast path with it.
 
 Cosmetics: each row's pie fills clockwise with the window and turns **red past
 75%**; reset times render with the system clock format (12-/24-hour) and locale;

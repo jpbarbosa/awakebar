@@ -91,26 +91,26 @@ removing the hooks or via **System Settings ▸ Notifications**. See
 
 ## Plan usage
 
-Turn on **Show Plan Usage** for an at-a-glance estimate of how much of your plan
-you've burned and when each window resets:
+Turn on **Show Plan Usage** to mirror Claude's `/usage` screen in the menu — the
+same numbers, the same windows, the same reset times:
 
-- **Session** — your trailing 5-hour window (e.g. `53% · in 2h 34m`).
-- **Weekly** — your trailing 7-day window (e.g. `23% · Sat 07:00`).
+- **Session** — the 5-hour block you're in (e.g. `8% · in 3h 20m`).
+- **Weekly** — your plan's 7-day period (e.g. `11% · Sat 07:00`).
+- **Weekly · Opus** / **Weekly · Sonnet** — the per-model rows, when your plan has them.
 
 Each row carries a small pie that fills as the window does and **turns red past
-75%**. The header — **Plan Usage (est.)** — links to your real usage page on the
-web. Reset times follow your Mac's clock format (12-/24-hour) and locale; the
-numbers update on a slow cadence — this is a glance, not a live dashboard.
+75%**. The header — **Plan Usage** — links to the usage page on the web. Reset
+times follow your Mac's clock format (12-/24-hour) and locale; the numbers refresh
+at most every 5 minutes — this is a glance, not a live dashboard.
 
-**It's an estimate** (hence the "est."), computed entirely on your Mac — no
-login, no network, no Keychain prompt. AwakeBar reads Claude Code's own session
-transcripts and self-calibrates: each window's percentage is its usage relative
-to the **biggest same-length window you've ever run**, so it needs no knowledge of
-your exact plan limit. That also means it reads ~100% whenever you set a new
-personal peak, and it can drift from the official `/usage` number — open the
-header link for the authoritative figure. **Off by default.** See
-[DESIGN.md](DESIGN.md) for the cost model and why it's an estimate rather than the
-exact numbers.
+**It needs an account.** Pick **Connect Claude Account…** and AwakeBar opens a
+Claude authorization page; approve it, paste the code back, and that's it. The
+token lives in AwakeBar's own Keychain item, so it never prompts again and never
+collides with Claude Code's. **Disconnect Claude Account** forgets it. Until you
+connect, the panel says so rather than guessing — see [DESIGN.md](DESIGN.md) for
+why the local estimate that used to fill that gap was removed.
+
+**Off by default.**
 
 ## Install the hooks
 

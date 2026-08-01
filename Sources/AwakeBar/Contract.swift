@@ -59,12 +59,11 @@ enum Contract {
     }
 }
 
-// MARK: - Plan-usage sources (web link + the live OAuth endpoint)
+// MARK: - Plan-usage sources (web link + the OAuth endpoint)
 //
-// Two ways the menu surfaces plan usage:
-//   • UsageLedger — the local estimate from the JSONL transcripts (no auth).
-//   • The live `/api/oauth/usage` endpoint below — the exact `/usage` numbers,
-//     reached with a token AwakeBar mints via its OWN OAuth login (UsageOAuth).
+// How the menu surfaces plan usage: the `/api/oauth/usage` endpoint below — the
+// exact `/usage` numbers, reached with a token AwakeBar mints via its OWN OAuth
+// login (UsageOAuth) — plus the web link the header opens.
 //
 // The OAuth literals live here as the single Swift-side source of truth, the way
 // Contract centralises the hook literals. They're reverse-engineered (Anthropic
