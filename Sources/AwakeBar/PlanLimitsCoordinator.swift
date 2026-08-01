@@ -167,7 +167,7 @@ final class PlanLimitsCoordinator {
             var estimate: PlanLimits.Usage? = nil
             var estimateCount = -1   // -1 = didn't scan this cycle
             if needEstimate {
-                let entries = UsageLedger.scan(projectsDir: dir)
+                let entries = await UsageLedger.Cache.shared.scan(projectsDir: dir)
                 estimate = UsageLedger.estimate(from: entries, now: Date())
                 estimateCount = entries.count
             }

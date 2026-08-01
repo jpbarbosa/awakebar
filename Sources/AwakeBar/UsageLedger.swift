@@ -128,27 +128,93 @@ enum UsageLedger {
 
     // MARK: Scan (IO — not unit-tested)
 
-    // Walk the transcripts, dedup, return entries sorted by time. We read every
-    // file because the peak needs full history; the caller throttles this (the
-    // bars move slowly) and runs it off the main actor. A byte pre-filter skips
-    // the ~95% of lines that can't be a usage line before the JSON parse.
+    // Walk the transcripts, dedup, return entries sorted by time. The rolling peak
+    // spans all history, so every file has to be *accounted for* on every scan —
+    // but re-*reading* them all doesn't: a 3 GB corpus re-parsed every 5 minutes is
+    // what made this the top CPU process on the machine. `Cache` keeps each file's
+    // parsed rows and re-reads only those whose (mtime, size) moved, which in a
+    // steady state is the one transcript currently being written.
+    //
+    // A byte pre-filter still skips lines that can't carry usage before the JSON
+    // parse — though only ~60% of them, not the ~95% this comment used to claim.
     private static let usageMarker = Data(#""usage""#.utf8)
 
-    static func scan(projectsDir: URL) -> [Entry] {
-        let fm = FileManager.default
-        guard let walker = fm.enumerator(at: projectsDir, includingPropertiesForKeys: nil) else { return [] }
-        var seen = Set<String>()
-        var entries: [Entry] = []
-        for case let url as URL in walker where url.pathExtension == "jsonl" {
-            guard let data = try? Data(contentsOf: url) else { continue }
+    // One parsed usage line: the dedup key, hashed, plus the entry itself.
+    // Hashed because keeping ~250k `<message.id>|<requestId>` strings resident
+    // costs ~20 MB in a menu-bar app; a 64-bit collision would drop a single
+    // response from an estimate that is self-calibrated anyway. `Hasher` is seeded
+    // per process, which is fine — this cache never outlives the process.
+    private struct Row: Sendable {
+        let key: UInt64
+        let entry: Entry
+    }
+
+    // Owns the cross-refresh cache. An actor because `scan` runs on a detached
+    // task; the coordinator's `inFlight` flag already serialises callers, but the
+    // compiler can't see that.
+    actor Cache {
+        static let shared = Cache()
+
+        private struct CachedFile: Sendable {
+            let mtime: Date
+            let size: Int
+            let rows: [Row]
+        }
+        private var files: [String: CachedFile] = [:]
+
+        private static let stat: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey]
+
+        func scan(projectsDir: URL) -> [Entry] {
+            let fm = FileManager.default
+            guard let walker = fm.enumerator(at: projectsDir,
+                                             includingPropertiesForKeys: Array(Self.stat))
+            else { return [] }
+
+            var fresh: [String: CachedFile] = [:]
+            var seen = Set<UInt64>()
+            var entries: [Entry] = []
+
+            for case let url as URL in walker where url.pathExtension == "jsonl" {
+                let values = try? url.resourceValues(forKeys: Self.stat)
+                let mtime = values?.contentModificationDate ?? .distantPast
+                let size = values?.fileSize ?? -1
+
+                let file: CachedFile
+                if let hit = files[url.path], hit.mtime == mtime, hit.size == size {
+                    file = hit
+                } else {
+                    file = CachedFile(mtime: mtime, size: size, rows: Self.rows(of: url))
+                }
+                fresh[url.path] = file
+                // Cross-file dedup survives the cache: a forked session replays
+                // earlier responses into a new transcript.
+                for row in file.rows where seen.insert(row.key).inserted {
+                    entries.append(row.entry)
+                }
+            }
+            // Rebuilt rather than mutated so deleted transcripts drop out.
+            files = fresh
+            return entries.sorted { $0.ts < $1.ts }
+        }
+
+        // Parse one transcript, deduped within the file (streaming writes 2–10
+        // lines per request). Mapped rather than read: these run to tens of MB and
+        // the old whole-file loads were most of the app's 600 MB resident peak.
+        private static func rows(of url: URL) -> [Row] {
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return [] }
+            var rows: [Row] = []
+            var local = Set<UInt64>()
             for slice in data.split(separator: UInt8(ascii: "\n")) {
                 let line = Data(slice)
-                guard line.range(of: usageMarker) != nil,
-                      let parsed = parse(line: line),
-                      seen.insert(parsed.key).inserted else { continue }
-                entries.append(parsed.entry)
+                guard line.range(of: UsageLedger.usageMarker) != nil,
+                      let parsed = UsageLedger.parse(line: line) else { continue }
+                var hasher = Hasher()
+                hasher.combine(parsed.key)
+                let key = UInt64(bitPattern: Int64(hasher.finalize()))
+                guard local.insert(key).inserted else { continue }
+                rows.append(Row(key: key, entry: parsed.entry))
             }
+            return rows
         }
-        return entries.sorted { $0.ts < $1.ts }
     }
 }

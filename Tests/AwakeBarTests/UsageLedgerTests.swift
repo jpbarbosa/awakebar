@@ -125,3 +125,84 @@ import Foundation
         #expect(u.isEmpty)
     }
 }
+
+// MARK: - Cache (incremental scan)
+
+// These do touch the filesystem — a temp dir of synthetic transcripts — because
+// the whole point of the cache is its interaction with file stat.
+@Suite struct UsageLedgerCacheTests {
+    private func line(id: String, req: String, ts: String, input: Int = 1_000_000) -> String {
+        #"{"type":"assistant","requestId":"\#(req)","timestamp":"\#(ts)","message":"# +
+        #"{"id":"\#(id)","model":"claude-sonnet-4","usage":{"input_tokens":\#(input),"# +
+        #""output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#
+    }
+
+    private func makeDir() throws -> URL {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ledger-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    @Test func scansDedupesAndSortsAcrossFiles() async throws {
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // b.jsonl repeats a.jsonl's first response (a forked session) — it must be
+        // counted once — and the two files are walked in unspecified order, so the
+        // result also has to come back sorted.
+        try [line(id: "m2", req: "r2", ts: "2026-06-01T08:00:00Z"),
+             line(id: "m1", req: "r1", ts: "2026-06-01T06:00:00Z")]
+            .joined(separator: "\n").write(to: dir.appendingPathComponent("a.jsonl"),
+                                           atomically: true, encoding: .utf8)
+        try [line(id: "m1", req: "r1", ts: "2026-06-01T06:00:00Z"),
+             line(id: "m3", req: "r3", ts: "2026-06-01T07:00:00Z")]
+            .joined(separator: "\n").write(to: dir.appendingPathComponent("b.jsonl"),
+                                           atomically: true, encoding: .utf8)
+
+        let entries = await UsageLedger.Cache().scan(projectsDir: dir)
+        #expect(entries.count == 3)
+        #expect(entries.map(\.ts) == entries.map(\.ts).sorted())
+    }
+
+    @Test func rereadsOnlyWhenMtimeOrSizeMoves() async throws {
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("a.jsonl")
+        try line(id: "m1", req: "r1", ts: "2026-06-01T06:00:00Z")
+            .write(to: file, atomically: true, encoding: .utf8)
+
+        let cache = UsageLedger.Cache()
+        #expect(await cache.scan(projectsDir: dir).count == 1)
+
+        // Rewrite with different content but restore the original (mtime, size) —
+        // the cache key. A stale result here is the proof the file was *not*
+        // re-read; without the cache this would return the new timestamp.
+        let stat = try FileManager.default.attributesOfItem(atPath: file.path)
+        let original = stat[.modificationDate] as! Date
+        try line(id: "m9", req: "r9", ts: "2026-06-02T06:00:00Z")
+            .write(to: file, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.modificationDate: original], ofItemAtPath: file.path)
+
+        let cached = await cache.scan(projectsDir: dir)
+        #expect(cached.first?.ts == PlanLimits.parseDate("2026-06-01T06:00:00Z"))
+
+        // Now let the mtime move: the new content must be picked up.
+        try FileManager.default.setAttributes([.modificationDate: original.addingTimeInterval(60)],
+                                              ofItemAtPath: file.path)
+        let refreshed = await cache.scan(projectsDir: dir)
+        #expect(refreshed.first?.ts == PlanLimits.parseDate("2026-06-02T06:00:00Z"))
+    }
+
+    @Test func droppedTranscriptsLeaveTheLedger() async throws {
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("a.jsonl")
+        try line(id: "m1", req: "r1", ts: "2026-06-01T06:00:00Z")
+            .write(to: file, atomically: true, encoding: .utf8)
+
+        let cache = UsageLedger.Cache()
+        #expect(await cache.scan(projectsDir: dir).count == 1)
+        try FileManager.default.removeItem(at: file)
+        #expect(await cache.scan(projectsDir: dir).isEmpty)
+    }
+}
