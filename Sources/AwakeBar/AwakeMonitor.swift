@@ -10,9 +10,10 @@ import Darwin   // kill(2), to test whether a Claude session PID is still alive
 // know about their own assertion; this watches the whole system.)
 //
 // All collection runs off the main thread (see AwakeMonitor.collect), so the
-// menu never blocks on `pmset` or on scanning Claude Code's logs. The work is
-// pure — it reads the world and returns a Sendable Snapshot — so there is no
-// shared mutable state to guard.
+// menu never blocks on `pmset` or on scanning Claude Code's logs. Collection is
+// otherwise pure — it reads the world and returns a Sendable Snapshot — with one
+// exception: `logMemo` caches the VSCode log walk and each log's parsed tail
+// across ticks, and guards that state with its own lock.
 
 enum AwakeMonitor {
     enum State: Sendable { case awake, canSleep }
@@ -47,6 +48,37 @@ enum AwakeMonitor {
         let cwd: String?
     }
 
+    // One live local Claude Code session, read from ~/.claude/sessions/<pid>.json:
+    // its friendly name (when Claude derived one), the project (cwd basename), the
+    // full cwd, and the most recent activity from the per-cwd marker. Surfaced in
+    // the menu's Sessions submenu — every live session, not just the
+    // remote-controlled ones the Remote Control rows list.
+    struct Session: Sendable {
+        let pid: Int
+        let name: String?
+        let project: String
+        let cwd: String?
+        let lastActivity: Date?
+        // The raw `entrypoint` from the session file — the source app. Map it for
+        // display with appLabel(forEntrypoint:).
+        let entrypoint: String?
+    }
+
+    // Friendly source-app label for a session's `entrypoint` (the field Claude Code
+    // writes into ~/.claude/sessions/<pid>.json). Known values map to a readable
+    // name; an unrecognised one falls through as-is so a new source still shows.
+    // Note: VS Code-family forks (Cursor, Windsurf) share "claude-vscode", so this
+    // names the family, not the exact editor. nil/empty → no label.
+    static func appLabel(forEntrypoint entrypoint: String?) -> String? {
+        guard let e = entrypoint, !e.isEmpty else { return nil }
+        switch e {
+        case "claude-vscode":                       return "VS Code"
+        case "claude-cli":                          return "Terminal"
+        case "claude-desktop", "claude-desktop-3p": return "Claude Desktop"
+        default:                                     return e
+        }
+    }
+
     // An immutable view of everything the menu needs, produced by collect().
     struct Snapshot: Sendable {
         var state: State = .canSleep
@@ -69,6 +101,12 @@ enum AwakeMonitor {
         // sessions, from their per-cwd markers; nil when no marker was found. The
         // app uses this to release its remote hold once a session goes idle.
         var remoteLastActivity: Date?
+
+        // Every live local Claude Code session (one per ~/.claude/sessions/<pid>.json
+        // named by a live PID), most-recently-active first. A superset of
+        // remoteSessions — the Sessions submenu lists these regardless of whether
+        // the Remote Control bridge is connected.
+        var sessions: [Session] = []
 
         // Attention notifications the VSCode extension surfaced (permission
         // prompts). Its in-panel toasts don't reach the OS and the Notification
@@ -157,8 +195,51 @@ enum AwakeMonitor {
         snap.hookInstalled = FileManager.default.fileExists(atPath: hookScriptPath)
         snap.remoteSessions = checkRemoteControl()
         snap.remoteLastActivity = lastActivity(of: snap.remoteSessions)
+        snap.sessions = collectSessions()
         snap.vscodeAttention = collectVSCodeAttention()
         return snap
+    }
+
+    // The fields we render out of a ~/.claude/sessions/<pid>.json (the file holds
+    // more — sessionId, version, entrypoint… — which JSONDecoder simply ignores).
+    private struct SessionFile: Decodable {
+        let cwd: String?
+        let name: String?
+        let entrypoint: String?
+    }
+
+    // Every live local session, most-recently-active first. Reads the same session
+    // files hasLiveSession() gates on, but parses each for its cwd/name and pairs it
+    // with the per-cwd activity marker so the menu can show "active 3m ago". This is
+    // the only place the menu surfaces plain local sessions — Remote Control lists
+    // just the bridge-connected subset.
+    static func collectSessions() -> [Session] {
+        let dir = home(".claude/sessions")
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir)
+        else { return [] }
+        var sessions: [Session] = []
+        for file in files where file.hasSuffix(".json") {
+            guard let pid = Int32(file.dropLast(5)), kill(pid, 0) == 0 else { continue }
+            let path = (dir as NSString).appendingPathComponent(file)
+            guard let data = FileManager.default.contents(atPath: path),
+                  let info = try? JSONDecoder().decode(SessionFile.self, from: data)
+            else { continue }
+            let project = info.cwd.map { ($0 as NSString).lastPathComponent } ?? "Claude session"
+            let last = info.cwd.flatMap { cwd -> Date? in
+                let ts = activityTs(forCwd: cwd)
+                return ts > 0 ? Date(timeIntervalSince1970: TimeInterval(ts)) : nil
+            }
+            sessions.append(Session(pid: Int(pid), name: info.name, project: project,
+                                    cwd: info.cwd, lastActivity: last,
+                                    entrypoint: info.entrypoint))
+        }
+        // Most-recently-active first; sessions with no activity marker sink to the
+        // bottom, ordered by pid among themselves for a stable display.
+        return sessions.sorted { a, b in
+            let ta = a.lastActivity ?? .distantPast
+            let tb = b.lastActivity ?? .distantPast
+            return ta != tb ? ta > tb : a.pid < b.pid
+        }
     }
 
     private static func runPmset() -> String {
@@ -219,8 +300,10 @@ enum AwakeMonitor {
         // least one Claude session is actually alive before trusting the logs.
         guard hasLiveSession() else { return [] }
         var sessions: [RemoteSession] = []
-        for log in recentVSCodeLogs(within: remoteLogFreshness) {
-            if let session = connectedProject(inTailOf: log),
+        for log in recentVSCodeLogs() {
+            if let session = logMemo.remoteSession(for: log, compute: {
+                   connectedProject(inTailOf: log)
+               }),
                !sessions.contains(where: { $0.project == session.project }) {
                 sessions.append(session)
             }
@@ -251,27 +334,36 @@ enum AwakeMonitor {
         guard hasLiveSession() else { return [] }
         let cutoff = Date().addingTimeInterval(-vscodeNotifyFreshness)
         var events: [VSCodeAttention] = []
-        for log in recentVSCodeLogs(within: remoteLogFreshness) {
-            guard let data = tailData(ofFile: log) else { continue }
-            let text = String(decoding: data, as: UTF8.self)
-            let project = projectLabel(in: data)
-            // One pass: collect resolution times and the notification lines.
-            var resolveTimes: [Date] = []
-            var notifs: [(time: Date, message: String)] = []
-            for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-                let isResolve = resolveMarkers.contains { line.contains($0) }
-                let isNotify = line.contains(notifyMarker) && line.contains(notifyWanted)
-                guard isResolve || isNotify, let t = lineTime(line) else { continue }
-                if isResolve { resolveTimes.append(t) }
-                if isNotify, let msg = notifyMessage(in: line) { notifs.append((t, msg)) }
-            }
-            for n in notifs where n.time >= cutoff {
-                events.append(VSCodeAttention(
-                    project: project, message: n.message, time: n.time,
-                    resolved: resolveTimes.contains { $0 > n.time }))
-            }
+        for log in recentVSCodeLogs() {
+            // The memo holds every event in the tail, unfiltered: `cutoff` moves
+            // with the clock, so applying it inside would freeze events at the
+            // age they had when the log was last parsed.
+            events += logMemo.attentionEvents(for: log, compute: {
+                attentionEvents(inTailOf: log)
+            }).filter { $0.time >= cutoff }
         }
         return events
+    }
+
+    // Every attention event in a log's tail, regardless of age — one pass
+    // collecting resolution times and notification lines, then pairing them.
+    private static func attentionEvents(inTailOf log: String) -> [VSCodeAttention] {
+        guard let data = tailData(ofFile: log) else { return [] }
+        let text = String(decoding: data, as: UTF8.self)
+        let project = projectLabel(in: data)
+        var resolveTimes: [Date] = []
+        var notifs: [(time: Date, message: String)] = []
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            let isResolve = resolveMarkers.contains { line.contains($0) }
+            let isNotify = line.contains(notifyMarker) && line.contains(notifyWanted)
+            guard isResolve || isNotify, let t = lineTime(line) else { continue }
+            if isResolve { resolveTimes.append(t) }
+            if isNotify, let msg = notifyMessage(in: line) { notifs.append((t, msg)) }
+        }
+        return notifs.map { n in
+            VSCodeAttention(project: project, message: n.message, time: n.time,
+                            resolved: resolveTimes.contains { $0 > n.time })
+        }
     }
 
     // Parse the leading "yyyy-MM-dd HH:mm:ss.SSS" timestamp of a log line, nil if
@@ -319,7 +411,115 @@ enum AwakeMonitor {
     // Bridge lifecycle markers live in the shared hook Contract (mirrored by
     // claude-hook-contract.sh), so a Claude Code rename is a one-line fix there.
 
+    // MARK: Log-tail memo
+    //
+    // collect() runs on a 5 s timer, and the VSCode log work behind it dominated
+    // the tick: ~70 ms walking the log tree (3.5k entries to find 2 live logs,
+    // done once per caller) plus ~145 ms per log to re-read a 2 MiB tail and
+    // re-scan it — all of it repeated whether or not a byte had been written.
+    //
+    // Both halves are memoised here: the walk on a short TTL, each log's derived
+    // value on that file's (mtime, size). An unchanged log now costs one stat.
+    //
+    // Note the walk is *not* pruned by the session directory's name, which looks
+    // like the obvious win — `logs/20260729T130556/…` is right there — and is
+    // wrong: that stamp is when the VSCode window opened, not when its log was
+    // last written, so a long-lived window's actively-written log gets skipped.
+    // Measured: 79× faster and it found none of the live logs.
+
+    // A file's cache identity — it has changed iff one of these moved. An append
+    // always moves `size`, so a missed update would need a write that changed
+    // neither byte count nor mtime.
+    // (internal, not private, so AwakeBarTests can drive the memo directly.)
+    struct Stamp: Equatable {
+        let mtime: Date
+        let size: Int
+
+        static func of(_ path: String) -> Stamp {
+            let a = try? FileManager.default.attributesOfItem(atPath: path)
+            return Stamp(mtime: a?[.modificationDate] as? Date ?? .distantPast,
+                         size: a?[.size] as? Int ?? -1)
+        }
+    }
+
+    // collect() is documented as safe off the main thread, so this is behind a
+    // lock rather than leaning on the caller's coalescing to serialise it.
+    // (internal, not private, so AwakeBarTests can drive the memo directly.)
+    final class LogMemo: @unchecked Sendable {
+        private let lock = NSLock()
+        private var walked: (logs: [String], at: Date)?
+        private var remote: [String: (stamp: Stamp, value: RemoteSession?)] = [:]
+        private var attention: [String: (stamp: Stamp, value: [VSCodeAttention])] = [:]
+
+        // The TTL only delays noticing a *brand-new* log file; new content in a
+        // log we already know about is picked up on the next tick via its stamp.
+        func logs(ttl: TimeInterval, compute: () -> [String]) -> [String] {
+            lock.lock()
+            if let walked, Date().timeIntervalSince(walked.at) < ttl {
+                defer { lock.unlock() }
+                return walked.logs
+            }
+            lock.unlock()
+
+            let fresh = compute()
+            lock.lock()
+            walked = (fresh, Date())
+            // Forget logs that dropped out of the walk, so a long-running app
+            // doesn't hold tails from closed windows forever.
+            let live = Set(fresh)
+            remote = remote.filter { live.contains($0.key) }
+            attention = attention.filter { live.contains($0.key) }
+            lock.unlock()
+            return fresh
+        }
+
+        func remoteSession(for path: String, compute: () -> RemoteSession?) -> RemoteSession? {
+            let stamp = Stamp.of(path)
+            lock.lock()
+            if let hit = remote[path], hit.stamp == stamp {
+                defer { lock.unlock() }
+                return hit.value
+            }
+            lock.unlock()
+
+            let fresh = compute()   // outside the lock: this reads 2 MiB
+            lock.lock()
+            remote[path] = (stamp, fresh)
+            lock.unlock()
+            return fresh
+        }
+
+        func attentionEvents(for path: String, compute: () -> [VSCodeAttention]) -> [VSCodeAttention] {
+            let stamp = Stamp.of(path)
+            lock.lock()
+            if let hit = attention[path], hit.stamp == stamp {
+                defer { lock.unlock() }
+                return hit.value
+            }
+            lock.unlock()
+
+            let fresh = compute()
+            lock.lock()
+            attention[path] = (stamp, fresh)
+            lock.unlock()
+            return fresh
+        }
+    }
+
+    private static let logMemo = LogMemo()
+
+    // How long a tree walk may be reused. Both callers in one collect() share it,
+    // and at a 5 s tick this drops the walk from every tick to every third.
+    private static let logWalkTTL: TimeInterval = 15
+
+    // Claude Code VSCode extension-host logs modified within `remoteLogFreshness`,
+    // memoised — every caller wants the same answer within a tick.
+    private static func recentVSCodeLogs() -> [String] {
+        logMemo.logs(ttl: logWalkTTL) { recentVSCodeLogs(within: remoteLogFreshness) }
+    }
+
     // Claude Code VSCode extension-host logs modified within `seconds`.
+    // (uncached — go through `recentVSCodeLogs()` unless you need a fresh walk.)
     private static func recentVSCodeLogs(within seconds: TimeInterval) -> [String] {
         let root = home("Library/Application Support/Code/logs")
         let fm = FileManager.default

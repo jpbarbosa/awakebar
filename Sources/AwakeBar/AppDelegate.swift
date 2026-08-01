@@ -317,6 +317,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             String(notifications.attentionGrace),
             String(remoteIdleTimeout),
             snap.remoteProjects.joined(separator: ","),
+            // Session identity + order, but not the volatile ages (like the hook
+            // line above, an age tick alone shouldn't churn the menu).
+            snap.sessions.map { "\($0.pid)|\($0.name ?? "")|\($0.project)|\($0.entrypoint ?? "")" }.joined(separator: ","),
             planLimits.menuSignature,
             planWarnFingerprint(),
             holders,
@@ -389,6 +392,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 infoText("Remote Control: Off", color: .secondaryLabelColor),
                 width: rowWidth))
         }
+
+        // Every live Claude Code session, in a submenu just above "Kept Awake By".
+        addSessions(to: menu)
 
         // What's actually holding the Mac awake — the process/assertion breakdown.
         // The hook/remote lines above already give the human "why", so for the
@@ -488,6 +494,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .withSymbolConfiguration(.init(pointSize: 12, weight: .semibold))
         quit.image = leadingSlot(power, template: true)
         menu.addItem(quit)
+    }
+
+    // The live-sessions submenu: one row per running Claude Code session — every
+    // session in ~/.claude/sessions named by a live PID, not just the
+    // remote-controlled ones the Remote Control rows list — most-recently-active
+    // first. A submenu so the common menu stays short, mirroring "Kept Awake By":
+    // a secondary-colour parent with a spacer in the leading slot so its title
+    // lines up with the dotted status rows above. Hidden when there are none.
+    private func addSessions(to menu: NSMenu) {
+        let sessions = snap.sessions
+        guard !sessions.isEmpty else { return }
+
+        let parent = NSMenuItem(title: "Sessions", action: nil, keyEquivalent: "")
+        parent.attributedTitle = infoText("Sessions: \(sessions.count)", color: .secondaryLabelColor)
+        parent.image = spacerSlot()   // align with the dotted status rows' text
+
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+
+        // Right column = the source app and the "active …" age, "·"-joined, lined
+        // up in their own right-aligned column: the tab sits past the widest label
+        // plus a gap, so no label collides with its detail.
+        let font = NSFont.menuFont(ofSize: 0)
+        func w(_ s: String) -> CGFloat { ceil((s as NSString).size(withAttributes: [.font: font]).width) }
+        func label(_ s: AwakeMonitor.Session) -> String { s.name ?? s.project }
+        func detail(_ s: AwakeMonitor.Session) -> String {
+            let app = AwakeMonitor.appLabel(forEntrypoint: s.entrypoint)
+            let age = s.lastActivity.map { "active \(Self.relativeAge($0))" }
+            return [app, age].compactMap { $0 }.joined(separator: " · ")
+        }
+        let widestLabel = sessions.map { w(label($0)) }.max() ?? 0
+        let widestDetail = sessions.map { w(detail($0)) }.max() ?? 0
+        let tabX = widestDetail > 0 ? widestLabel + 24 + widestDetail : widestLabel
+        let rowWidth = ceil(Self.infoRowTextX + tabX + Self.infoRowTrailing)
+
+        for s in sessions {
+            sub.addItem(infoRow(leading: nil,
+                                planAttributed(left: label(s), right: detail(s), tabX: tabX),
+                                width: rowWidth))
+        }
+        parent.submenu = sub
+        menu.addItem(parent)
     }
 
     // Horizontal/vertical layout for the custom info-row views (InfoRowView),
