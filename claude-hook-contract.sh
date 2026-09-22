@@ -30,11 +30,14 @@ CLAUDE_REASON_REMOTE="remote"
 # a backstop so a missed Stop can't keep the Mac awake indefinitely.
 CLAUDE_DEFAULT_CAP=14400
 
-# VSCode bridge lifecycle markers (mirror Contract.bridgeConnect/TeardownMarkers),
-# as one grep -oE alternation. keep-awake.sh greps the log tail for the last
-# match and treats a teardown marker ("Torn down"/"Archive session") as
-# disconnected.
-CLAUDE_BRIDGE_MARKERS_RE='\[bridge:sdk\] State change: (connected|ready)|\[remote-bridge\] (v2 transport connected|Created session|Torn down|Archive session)'
+# Per-session caffeinate holds, one pidfile per session id, so a Stop in one
+# session cannot release another's. Each holds "<pid> <reason> <session pid>".
+CLAUDE_HOLD_DIR="${CLAUDE_PIDFILE%.pid}.d"
+
+# Claude Code's per-session records, named by pid; bridgeSessionId is set while
+# that session has a Remote Control bridge, in any host. (Swift: Contract.)
+CLAUDE_SESSIONS_DIR="${CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}"
+CLAUDE_BRIDGE_FIELD="bridgeSessionId"
 
 # cwd → marker-key: non-alphanumerics to '_' (mirror Contract.markerKey), so both
 # sides name the same per-cwd activity/turnstart files for a given cwd.
@@ -51,6 +54,20 @@ field() {
   if [ -z "$v" ]; then
     v=$(printf '%s' "$input" | tr -d '\n' \
       | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p")
+  fi
+  printf '%s' "$v"
+}
+
+# Pull a string field from a JSON file — the file twin of field() above.
+json_field() {
+  local v=""
+  [ -r "$1" ] || return 0
+  if command -v jq >/dev/null 2>&1; then
+    v=$(jq -r --arg k "$2" '.[$k] // empty' "$1" 2>/dev/null)
+  fi
+  if [ -z "$v" ]; then
+    v=$(tr -d '\n' < "$1" 2>/dev/null \
+      | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p")
   fi
   printf '%s' "$v"
 }

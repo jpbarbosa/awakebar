@@ -73,20 +73,17 @@ import Foundation
         #expect(after.first?.message.contains("two") == true)
     }
 
-    @Test func remoteAndAttentionCachesAreIndependent() throws {
+    @Test func anEmptyResultIsCachedRatherThanRecomputed() throws {
         let path = try tempFile("x\n")
         defer { try? FileManager.default.removeItem(atPath: path) }
         let memo = AwakeMonitor.LogMemo()
-        var remoteComputes = 0
-        // A nil remote session is a real answer (bridge down), not a cache miss —
-        // it must be remembered rather than recomputed every tick.
+        var computes = 0
+        // No events is a real answer, not a cache miss — it must be remembered
+        // rather than re-reading the tail every tick.
         for _ in 0..<3 {
-            _ = memo.remoteSession(for: path) { remoteComputes += 1; return nil }
+            _ = memo.attentionEvents(for: path) { computes += 1; return [] }
         }
-        #expect(remoteComputes == 1)
-        var attentionComputes = 0
-        _ = memo.attentionEvents(for: path) { attentionComputes += 1; return [] }
-        #expect(attentionComputes == 1, "the remote cache must not satisfy an attention lookup")
+        #expect(computes == 1)
     }
 
     @Test func theWalkIsReusedWithinItsTTLAndRefreshedAfter() throws {

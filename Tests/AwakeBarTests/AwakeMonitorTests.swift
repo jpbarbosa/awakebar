@@ -132,60 +132,106 @@ import Foundation
     }
 }
 
-// MARK: - connectedProject (drives the file-reading path with sample logs)
+// MARK: - remoteSessions / collectSessions (the session-file path)
 
-@Suite struct ConnectedProjectTests {
-    // Write `contents` to a unique temp file, run `body` with its path, then clean
-    // up — connectedProject reads the file itself, so it needs a real path.
-    private func withLog(_ contents: String,
-                         _ body: (String) -> Void) {
-        let dir = NSTemporaryDirectory()
-        let path = (dir as NSString).appendingPathComponent(
-            "awakebar-test-\(ProcessInfo.processInfo.globallyUniqueString).log")
-        try? contents.write(toFile: path, atomically: true, encoding: .utf8)
-        defer { try? FileManager.default.removeItem(atPath: path) }
-        body(path)
+@Suite struct RemoteSessionsTests {
+    private func session(_ project: String, bridged: Bool) -> AwakeMonitor.Session {
+        AwakeMonitor.Session(pid: 1, name: nil, project: project,
+                             cwd: "/Users/jp/Sites/" + project, lastActivity: nil,
+                             entrypoint: "cli", bridgeConnected: bridged)
     }
 
-    @Test func connectedReturnsProjectAndCwd() {
-        withLog("""
-        2026-05-30 14:00:00.000 [remote-bridge] v2 transport connected
-        2026-05-30 14:00:01.000 Spawning Claude with SDK query function - cwd: /Users/jp/Sites/awakebar, x
-        """) { path in
-            let session = AwakeMonitor.connectedProject(inTailOf: path)
-            #expect(session?.project == "awakebar")
-            #expect(session?.cwd == "/Users/jp/Sites/awakebar")
+    @Test func picksOnlyBridgedSessions() {
+        let out = AwakeMonitor.remoteSessions(among: [
+            session("awakebar", bridged: false),
+            session("maru", bridged: true),
+        ])
+        #expect(out.map(\.project) == ["maru"])
+        #expect(out.first?.cwd == "/Users/jp/Sites/maru")
+    }
+
+    @Test func dedupesByProject() {
+        // Five sessions open on one folder are one Remote Control row.
+        let out = AwakeMonitor.remoteSessions(among: (0..<5).map { _ in
+            session("interadmin", bridged: true)
+        })
+        #expect(out.count == 1)
+    }
+
+    @Test func noneBridgedIsEmpty() {
+        #expect(AwakeMonitor.remoteSessions(among: [session("a", bridged: false)]).isEmpty)
+    }
+}
+
+@Suite struct CollectSessionsTests {
+    // Session files are named by pid and only live pids count, so the fixtures are
+    // named after this test process.
+    private func withSessionDir(_ json: String, _ body: (String) -> Void) {
+        let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent(
+            "awakebar-sessions-\(ProcessInfo.processInfo.globallyUniqueString)")
+        try? FileManager.default.createDirectory(atPath: dir,
+                                                 withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let path = (dir as NSString).appendingPathComponent("\(pid).json")
+        try? json.write(toFile: path, atomically: true, encoding: .utf8)
+        body(dir)
+    }
+
+    @Test func readsBridgeCwdAndUpdatedAt() {
+        withSessionDir("""
+        {"pid":1,"cwd":"/Users/jp/Sites/maru","entrypoint":"cli",
+         "bridgeSessionId":"session_01ABC","updatedAt":1790000000000}
+        """) { dir in
+            let sessions = AwakeMonitor.collectSessions(inDirectory: dir)
+            #expect(sessions.count == 1)
+            #expect(sessions.first?.project == "maru")
+            #expect(sessions.first?.bridgeConnected == true)
+            #expect(sessions.first?.lastActivity == Date(timeIntervalSince1970: 1_790_000_000))
         }
     }
 
-    @Test func teardownAfterConnectReturnsNil() {
-        withLog("""
-        2026-05-30 14:00:00.000 [remote-bridge] v2 transport connected
-        2026-05-30 14:00:01.000 Spawning Claude with SDK query function - cwd: /Users/jp/Sites/awakebar, x
-        2026-05-30 14:05:00.000 [remote-bridge] Torn down
-        """) { path in
-            #expect(AwakeMonitor.connectedProject(inTailOf: path) == nil)
+    @Test func noBridgeFieldIsNotConnected() {
+        withSessionDir("""
+        {"pid":1,"cwd":"/Users/jp/Sites/maru","entrypoint":"claude-vscode"}
+        """) { dir in
+            #expect(AwakeMonitor.collectSessions(inDirectory: dir).first?.bridgeConnected == false)
         }
     }
 
-    @Test func bridgeTrafficWithoutMarkersCountsAsConnected() {
-        // No lifecycle marker survives in the tail, but bridge traffic is present —
-        // treated as a connected session past its handshake.
-        withLog("""
-        2026-05-30 14:00:00.000 [remote-bridge] forwarding message
-        2026-05-30 14:00:01.000 {"cwd":"/Users/jp/proj"}
-        """) { path in
-            #expect(AwakeMonitor.connectedProject(inTailOf: path)?.project == "proj")
+    @Test func emptyBridgeFieldIsNotConnected() {
+        withSessionDir("""
+        {"pid":1,"cwd":"/Users/jp/Sites/maru","bridgeSessionId":""}
+        """) { dir in
+            #expect(AwakeMonitor.collectSessions(inDirectory: dir).first?.bridgeConnected == false)
         }
     }
 
-    @Test func noBridgeContentReturnsNil() {
-        withLog("""
-        2026-05-30 14:00:00.000 [info] ordinary log line
-        2026-05-30 14:00:01.000 [info] nothing bridge-related here
-        """) { path in
-            #expect(AwakeMonitor.connectedProject(inTailOf: path) == nil)
-        }
+    @Test func deadPidIsSkipped() {
+        let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent(
+            "awakebar-sessions-\(ProcessInfo.processInfo.globallyUniqueString)")
+        try? FileManager.default.createDirectory(atPath: dir,
+                                                 withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        // PID 0 is never a live user process, so kill(0, 0) cannot vouch for it.
+        try? "{\"cwd\":\"/x\",\"bridgeSessionId\":\"s\"}"
+            .write(toFile: (dir as NSString).appendingPathComponent("0.json"),
+                   atomically: true, encoding: .utf8)
+        #expect(AwakeMonitor.collectSessions(inDirectory: dir).isEmpty)
+    }
+}
+
+// MARK: - appLabel
+
+@Suite struct AppLabelTests {
+    @Test func mapsTheEntrypointsClaudeCodeWrites() {
+        // "cli" is what a terminal session actually writes; "claude-cli" is kept
+        // because an older Claude Code wrote that.
+        #expect(AwakeMonitor.appLabel(forEntrypoint: "cli") == "Terminal")
+        #expect(AwakeMonitor.appLabel(forEntrypoint: "claude-cli") == "Terminal")
+        #expect(AwakeMonitor.appLabel(forEntrypoint: "claude-vscode") == "VS Code")
+        #expect(AwakeMonitor.appLabel(forEntrypoint: "something-new") == "something-new")
+        #expect(AwakeMonitor.appLabel(forEntrypoint: nil) == nil)
     }
 }
 

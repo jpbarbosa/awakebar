@@ -47,13 +47,12 @@ answered. Turn it off to keep delivered alerts as a record.
 **VSCode is the exception.** The `Notification` hook never fires for VSCode's
 *in-panel* permission prompts — it's a terminal-CLI event — so the hook path
 covers terminal sessions only. For VSCode, AwakeBar instead reads the
-extension's debug log (the same log it uses for Remote Control), which records
+extension's debug log, which records
 the extension's own `show_notification` intent (*"Claude is requesting permission
 to use …"*) and the resolution (`tool_permission_response`, or the session
 leaving `waiting_input`). The same grace applies — answer within the window and
-no banner fires. Like the Remote Control detection this parses undocumented log
-strings, centralised in `Sources/AwakeBar/Contract.swift` (mirrored by
-`claude-hook-contract.sh`) so a Claude Code rename is a one-line fix.
+no banner fires. This parses undocumented log strings, and is the only thing
+left that reads that log: Remote Control detection moved off it (below).
 
 It works for any session — terminal (via the hook) or VSCode (via the log), in
 any window.
@@ -99,6 +98,15 @@ sleeping. The between-turns hold is bounded: each turn restarts `caffeinate` wit
 `-t` set to the idle window AwakeBar publishes at `/tmp/claude-keep-awake.idle`
 (default 4 h when that file is absent), so an idle remote session stops holding
 once the window passes with no new turn.
+
+Each session holds **its own** `caffeinate`, tracked in
+`/tmp/claude-keep-awake.d/<session-id>.pid` (caffeinate pid, reason, session
+pid). One shared hold cannot survive two open sessions: whichever reaches `Stop`
+first releases the Mac while the others are still working. The aggregate
+`/tmp/claude-keep-awake.pid` and `.reason` are republished from the live holds,
+because that pair is what AwakeBar reads - an active turn outranks a remote hold
+in the wording. A hold whose session died without a `SessionEnd` is swept on the
+next hook.
 
 `SessionStart` is wired `async` so a Remote Control session is held from the
 moment it connects, not just from the first turn. While caffeinate runs the hook
@@ -150,31 +158,48 @@ chosen window to `/tmp/claude-keep-awake.idle`, and `keep-awake.sh` restarts its
 between-turns `caffeinate` with that as its `-t`, so the hook's own hold expires
 on the same window instead of its 4 h backstop. Set the timeout to **Off** to
 restore the old behavior (held as long as the bridge is connected; hook caps at
-4 h/prompt). The idle signal comes from `notify-attention.sh`'s per-cwd activity
-markers, so that hook must be installed for sub-4 h capping to apply.
+4 h/prompt). The idle signal is each session's own `updatedAt`, falling back to
+`notify-attention.sh`'s per-cwd markers, so capping needs no hook installed.
 
 ## How Remote Control is detected
 
-Claude Code no longer records Remote Control state in a file AwakeBar can read
-(the old `~/.claude/sessions/<pid>.json` `bridgeSessionId` field is gone), and
-the bridge multiplexes over the same TLS as normal inference, so it can't be
-spotted from sockets either. Both the app and the hook fall back to the only
-on-disk trace: the bridge **lifecycle** logged by Claude Code's VSCode
-extension-host log, trusting the last connect/teardown marker. This is
-best-effort — it works for **VSCode-hosted** sessions running with `--debug`
-(the extension's default), and reads as "off" for pure-terminal sessions. The
-marker strings are centralised in `Sources/AwakeBar/Contract.swift` and its shell
-mirror `claude-hook-contract.sh` so a Claude Code rename is a one-line fix.
+The bridge multiplexes over the same TLS as normal inference, so it can't be
+spotted from sockets. Both halves read `bridgeSessionId` from Claude Code's own
+`~/.claude/sessions/<pid>.json`. The **hook** asks it of the session firing the
+hook, so a stale field on some other idle session can't decide this one's hold;
+the **app** takes every file named by a live PID and treats the ones carrying the
+field as the connected set, deduped by `cwd` so several sessions in one folder
+are one row.
 
-The app goes one step further and **lists which project** each connected
-session is driving: the same log records the session's `cwd` (in its
-`launch_claude` / `Spawning Claude` lines), so the menu shows the folder name
-under **Remote control: active**. The cwd parse is anchored to those two
-authoritative line shapes — the log also echoes back tool inputs (e.g. bash
-commands you run), which can mention `cwd:` and must not be mistaken for the
-real one. Granularity is per-window/per-project, not per-pid (one window
-normally drives one session); if the launch line has scrolled out of the log
-tail the entry falls back to a generic "Claude session".
+That source is host-agnostic: the CLI, desktop VSCode and a code-server tile all
+write it. It replaced a walk of the VSCode extension-host log, which could only
+ever see desktop VSCode. The cost of that was invisible rather than noisy: the
+app's own hold simply never fired here, because these sessions run under Code
+Tiles, and a 7-day `pmset -g log` contained not one `AwakeBar: Remote Control
+session connected` assertion while terminal and tile sessions were bridged
+throughout. **A detector that can only see one host reads as "off" everywhere
+else, and "off" looks exactly like "nothing to do".**
+
+`bridgeSessionId` is undocumented and has vanished from that file once before, so
+if remote sessions stop being detected, check it is still written before looking
+anywhere else. The hook now depends on the same field, which is the point: the
+two halves fail together and visibly, instead of one going quietly dark.
+
+The same file carries what the log used to be parsed for, without the parsing:
+`cwd` names the project under **Remote Control: Active** (no `launch_claude` /
+`Spawning Claude` anchors, and no risk of an echoed tool input's `cwd:` being
+mistaken for the real one), `entrypoint` names the host, and `updatedAt` is the
+idle clock. Granularity is per-session rather than per-window.
+
+`updatedAt` is Claude Code's own last-activity stamp and does **not** heartbeat -
+a session idle for 17 hours still reads the timestamp of its last real activity -
+so it caps an idle remote session directly. The per-cwd markers
+`notify-attention.sh` writes stay as the fallback, which means sub-4h capping no
+longer needs that hook installed.
+
+Note the extension-host log is still read, for the **attention notifications**
+below: those are VSCode-only by nature, since they exist to catch in-panel
+prompts that never reach the OS.
 
 ## Plan usage (the optional `/usage` panel)
 

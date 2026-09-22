@@ -40,9 +40,9 @@ enum AwakeMonitor {
         let resolved: Bool
     }
 
-    // One VSCode window whose Remote Control bridge is connected: a display label
-    // (the cwd basename) and the full cwd, when discoverable, for its activity
-    // marker. cwd is nil when the log's tail carried no usable cwd line.
+    // One project whose Remote Control bridge is connected: a display label (the
+    // cwd basename) and the full cwd. cwd is nil only when the session file
+    // carried none.
     struct RemoteSession: Sendable {
         let project: String
         let cwd: String?
@@ -62,6 +62,8 @@ enum AwakeMonitor {
         // The raw `entrypoint` from the session file — the source app. Map it for
         // display with appLabel(forEntrypoint:).
         let entrypoint: String?
+        // True while Claude Code records a Remote Control bridge for this session.
+        let bridgeConnected: Bool
     }
 
     // Friendly source-app label for a session's `entrypoint` (the field Claude Code
@@ -73,7 +75,7 @@ enum AwakeMonitor {
         guard let e = entrypoint, !e.isEmpty else { return nil }
         switch e {
         case "claude-vscode":                       return "VS Code"
-        case "claude-cli":                          return "Terminal"
+        case "cli", "claude-cli":                   return "Terminal"
         case "claude-desktop", "claude-desktop-3p": return "Claude Desktop"
         default:                                     return e
         }
@@ -97,9 +99,8 @@ enum AwakeMonitor {
         var remoteProjects: [String] { remoteSessions.map(\.project) }
         var remoteControlActive: Bool { !remoteSessions.isEmpty }
 
-        // The most recent activity (prompt/tool/stop) across the connected remote
-        // sessions, from their per-cwd markers; nil when no marker was found. The
-        // app uses this to release its remote hold once a session goes idle.
+        // Most recent activity across the connected remote sessions; the app
+        // releases its remote hold once this goes stale.
         var remoteLastActivity: Date?
 
         // Every live local Claude Code session (one per ~/.claude/sessions/<pid>.json
@@ -193,9 +194,10 @@ enum AwakeMonitor {
         snap.hookActive = snap.holders.contains { $0.isClaudeHook }
         snap.hookReason = snap.hookActive ? readHookReason() : .unknown
         snap.hookInstalled = FileManager.default.fileExists(atPath: hookScriptPath)
-        snap.remoteSessions = checkRemoteControl()
-        snap.remoteLastActivity = lastActivity(of: snap.remoteSessions)
         snap.sessions = collectSessions()
+        snap.remoteSessions = remoteSessions(among: snap.sessions)
+        snap.remoteLastActivity = snap.sessions
+            .filter(\.bridgeConnected).compactMap(\.lastActivity).max()
         snap.vscodeAttention = collectVSCodeAttention()
         return snap
     }
@@ -206,32 +208,40 @@ enum AwakeMonitor {
         let cwd: String?
         let name: String?
         let entrypoint: String?
+        // Present, and non-empty, while this session has a Remote Control bridge.
+        let bridgeSessionId: String?
+        // Last activity, epoch milliseconds. Claude Code bumps it on real activity
+        // and does NOT heartbeat, so a session idle for hours keeps its old value.
+        let updatedAt: Double?
     }
 
-    // Every live local session, most-recently-active first. Reads the same session
-    // files hasLiveSession() gates on, but parses each for its cwd/name and pairs it
-    // with the per-cwd activity marker so the menu can show "active 3m ago". This is
-    // the only place the menu surfaces plain local sessions — Remote Control lists
-    // just the bridge-connected subset.
-    static func collectSessions() -> [Session] {
-        let dir = home(".claude/sessions")
+    // Every live local session, most-recently-active first: one per session file
+    // named by a live PID. Feeds the Sessions submenu and, through
+    // remoteSessions(among:), the Remote Control rows.
+    //
+    // Activity prefers the file's own `updatedAt` over the per-cwd marker: it is
+    // per session rather than per folder, and needs no hook installed.
+    static func collectSessions(inDirectory dir: String = Contract.sessionsDir) -> [Session] {
         guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir)
         else { return [] }
         var sessions: [Session] = []
         for file in files where file.hasSuffix(".json") {
-            guard let pid = Int32(file.dropLast(5)), kill(pid, 0) == 0 else { continue }
+            guard let pid = Int32(file.dropLast(5)), pid > 0, kill(pid, 0) == 0
+            else { continue }
             let path = (dir as NSString).appendingPathComponent(file)
             guard let data = FileManager.default.contents(atPath: path),
                   let info = try? JSONDecoder().decode(SessionFile.self, from: data)
             else { continue }
             let project = info.cwd.map { ($0 as NSString).lastPathComponent } ?? "Claude session"
-            let last = info.cwd.flatMap { cwd -> Date? in
+            let marker = info.cwd.flatMap { cwd -> Date? in
                 let ts = activityTs(forCwd: cwd)
                 return ts > 0 ? Date(timeIntervalSince1970: TimeInterval(ts)) : nil
             }
+            let updated = info.updatedAt.map { Date(timeIntervalSince1970: $0 / 1000) }
             sessions.append(Session(pid: Int(pid), name: info.name, project: project,
-                                    cwd: info.cwd, lastActivity: last,
-                                    entrypoint: info.entrypoint))
+                                    cwd: info.cwd, lastActivity: updated ?? marker,
+                                    entrypoint: info.entrypoint,
+                                    bridgeConnected: !(info.bridgeSessionId ?? "").isEmpty))
         }
         // Most-recently-active first; sessions with no activity marker sink to the
         // bottom, ordered by pid among themselves for a stable display.
@@ -275,41 +285,20 @@ enum AwakeMonitor {
         }
     }
 
-    // Live remote-control check — returns the project folder of each VSCode
-    // window whose Remote Control bridge is currently connected (deduped).
-    //
-    // Claude Code no longer records Remote Control state in
-    // ~/.claude/sessions/<pid>.json (the old `bridgeSessionId` field is gone),
-    // and the bridge multiplexes over the same TLS as normal inference, so it
-    // can't be spotted from sockets or process state either. The only on-disk
-    // trace for a VSCode-hosted session is the extension-host debug log, which
-    // records both the bridge lifecycle *and* the session's cwd. Per log we
-    // read the tail and trust the last lifecycle marker: a connect-class marker
-    // newer than any teardown means the bridge is up, and the most recent cwd
-    // line in the same tail names the project.
-    //
-    // Best-effort heuristic (documented in the README):
-    //  * VSCode only — pure-terminal sessions log to stderr, not this file.
-    //  * Needs a --debug session (Claude's VSCode extension runs with it).
-    //  * Per-window/per-project granularity, not per-pid: one window normally
-    //    drives one session, so cwd is a faithful label.
-    //  * Parses undocumented debug strings; the markers are centralised below
-    //    so a Claude Code rename is a one-line fix here.
-    private static func checkRemoteControl() -> [RemoteSession] {
-        // A crashed session can leave a "connected" log behind; require that at
-        // least one Claude session is actually alive before trusting the logs.
-        guard hasLiveSession() else { return [] }
-        var sessions: [RemoteSession] = []
-        for log in recentVSCodeLogs() {
-            if let session = logMemo.remoteSession(for: log, compute: {
-                   connectedProject(inTailOf: log)
-               }),
-               !sessions.contains(where: { $0.project == session.project }) {
-                sessions.append(session)
-            }
+    // The Remote Control rows: the bridge-connected subset of the live sessions,
+    // deduped by project so two sessions in one folder list once. Reading Claude
+    // Code's own session files is what makes this host-agnostic - the CLI, desktop
+    // VSCode and a code-server tile all write `bridgeSessionId`. That field is
+    // undocumented and has vanished once, so check it is still written before
+    // looking anywhere else if detection stops.
+    static func remoteSessions(among sessions: [Session]) -> [RemoteSession] {
+        var seen = Set<String>()
+        return sessions.filter(\.bridgeConnected).compactMap { session in
+            guard seen.insert(session.project).inserted else { return nil }
+            return RemoteSession(project: session.project, cwd: session.cwd)
         }
-        return sessions
     }
+
 
     // MARK: VSCode attention notifications
 
@@ -394,11 +383,11 @@ enum AwakeMonitor {
 
     // True when some ~/.claude/sessions/<pid>.json is named by a live PID.
     private static func hasLiveSession() -> Bool {
-        let dir = home(".claude/sessions")
+        let dir = Contract.sessionsDir
         guard let files = try? FileManager.default
             .contentsOfDirectory(atPath: dir) else { return false }
         for file in files where file.hasSuffix(".json") {
-            if let pid = Int32(file.dropLast(5)), kill(pid, 0) == 0 { return true }
+            if let pid = Int32(file.dropLast(5)), pid > 0, kill(pid, 0) == 0 { return true }
         }
         return false
     }
@@ -407,9 +396,6 @@ enum AwakeMonitor {
     // bridge can go quiet for many minutes (observed gaps up to ~13 min), so
     // the window is generous; the live-session gate above guards the rest.
     private static let remoteLogFreshness: TimeInterval = 30 * 60
-
-    // Bridge lifecycle markers live in the shared hook Contract (mirrored by
-    // claude-hook-contract.sh), so a Claude Code rename is a one-line fix there.
 
     // MARK: Log-tail memo
     //
@@ -448,7 +434,6 @@ enum AwakeMonitor {
     final class LogMemo: @unchecked Sendable {
         private let lock = NSLock()
         private var walked: (logs: [String], at: Date)?
-        private var remote: [String: (stamp: Stamp, value: RemoteSession?)] = [:]
         private var attention: [String: (stamp: Stamp, value: [VSCodeAttention])] = [:]
 
         // The TTL only delays noticing a *brand-new* log file; new content in a
@@ -467,24 +452,7 @@ enum AwakeMonitor {
             // Forget logs that dropped out of the walk, so a long-running app
             // doesn't hold tails from closed windows forever.
             let live = Set(fresh)
-            remote = remote.filter { live.contains($0.key) }
             attention = attention.filter { live.contains($0.key) }
-            lock.unlock()
-            return fresh
-        }
-
-        func remoteSession(for path: String, compute: () -> RemoteSession?) -> RemoteSession? {
-            let stamp = Stamp.of(path)
-            lock.lock()
-            if let hit = remote[path], hit.stamp == stamp {
-                defer { lock.unlock() }
-                return hit.value
-            }
-            lock.unlock()
-
-            let fresh = compute()   // outside the lock: this reads 2 MiB
-            lock.lock()
-            remote[path] = (stamp, fresh)
             lock.unlock()
             return fresh
         }
@@ -537,41 +505,6 @@ enum AwakeMonitor {
         return logs
     }
 
-    // The project label for a log whose bridge is connected, else nil.
-    //
-    // Works on the raw bytes of the tail (no String/line splitting): finding
-    // the last occurrence of each marker with a backwards byte search is ~400×
-    // faster than scanning ~20k lines with Unicode-aware `contains`, which kept
-    // the menu fast even on multi-MB logs. The bridge is "connected" when the
-    // last lifecycle marker is a connect-class one; if no marker survives in
-    // the tail (handshake scrolled off) but bridge traffic is present, that's a
-    // connected session past its handshake. The label is the basename of the
-    // most recent cwd in the tail, or a generic name if none survived; the full
-    // cwd rides along (when found) so the caller can find its activity marker.
-    // (internal, not private, so AwakeBarTests can drive it with sample logs.)
-    static func connectedProject(inTailOf path: String) -> RemoteSession? {
-        guard let data = tailData(ofFile: path) else { return nil }
-
-        func lastIndex(of marker: String) -> Int? {
-            data.range(of: Data(marker.utf8), options: .backwards)?.lowerBound
-        }
-        let lastConnect = Contract.bridgeConnectMarkers.compactMap { lastIndex(of: $0) }.max()
-        let lastTeardown = Contract.bridgeTeardownMarkers.compactMap { lastIndex(of: $0) }.max()
-        let connected: Bool?
-        if let c = lastConnect, let t = lastTeardown { connected = c > t }
-        else if lastConnect != nil { connected = true }
-        else if lastTeardown != nil { connected = false }
-        else { connected = nil }
-
-        let sawBridgeActivity = Contract.bridgeTrafficPrefixes
-            .contains { data.range(of: Data($0.utf8)) != nil }
-        guard connected ?? sawBridgeActivity else { return nil }
-
-        let cwd = lastCwd(in: data)
-        let project = cwd.map { ($0 as NSString).lastPathComponent } ?? "Claude session"
-        return RemoteSession(project: project, cwd: cwd)
-    }
-
     // The most recent cwd a VSCode-hosted session was launched with, read from
     // the same tail. Two authoritative line shapes carry it: the extension's
     // `Spawning Claude … - cwd: <path>,` line and the `launch_claude` webview
@@ -608,16 +541,6 @@ enum AwakeMonitor {
     }
 
     // MARK: Remote idle
-
-    // The most recent activity across the given remote sessions, read from their
-    // per-cwd markers; nil when none has a marker (or none carried a cwd).
-    private static func lastActivity(of sessions: [RemoteSession]) -> Date? {
-        sessions.compactMap { session -> Date? in
-            guard let cwd = session.cwd else { return nil }
-            let ts = activityTs(forCwd: cwd)
-            return ts > 0 ? Date(timeIntervalSince1970: TimeInterval(ts)) : nil
-        }.max()
-    }
 
     // Last activity epoch for a session cwd, from the per-cwd marker
     // notify-attention.sh bumps on prompt/tool/stop events; 0 when none exists.

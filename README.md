@@ -122,7 +122,7 @@ behavior. Copy all three files to `~/.claude/` and `chmod +x` the two hooks:
   Remote Control session, so a claude.ai / mobile session isn't dropped by idle
   sleep), and lights up the **Claude Code Hook** menu line.
 - `claude-hook-contract.sh` — shared definitions both hooks source (the marker
-  paths, bridge markers, and reason tokens, mirroring the app's `Contract.swift`).
+  paths, the sessions dir, and reason tokens, mirroring the app's `Contract.swift`).
   Not a hook itself; it must sit beside the two scripts in `~/.claude/`.
 
 Then wire them into `~/.claude/settings.json`:

@@ -14,12 +14,13 @@ Product docs: [README.md](README.md). Mechanics & rationale: [DESIGN.md](DESIGN.
 `Sources/AwakeBar/`, one file per type:
 
 - `Contract.swift` — the single source of truth for the hook IPC: the `/tmp`
-  marker paths, VSCode bridge markers, reason tokens, and cwd sanitiser
+  marker paths, Claude Code's sessions dir, reason tokens, and cwd sanitiser
   (mirrored on the shell side by `claude-hook-contract.sh`). Also holds the
   app-only `UsageAPI` constants: the plan-usage web link plus the OAuth/`/usage`
   endpoint literals (client id, authorize/token hosts, scope, Keychain service).
-- `AwakeMonitor.swift` — reads `pmset -g assertions` and parses the VSCode
-  extension-host log (Remote Control lifecycle + VSCode in-panel permission prompts).
+- `AwakeMonitor.swift` — reads `pmset -g assertions`, Claude Code's
+  `~/.claude/sessions/<pid>.json` (live sessions + which have a Remote Control
+  bridge), and the VSCode extension-host log (in-panel permission prompts).
 - `NotificationCoordinator.swift` — owns the "Claude is waiting / task finished /
   VSCode permission" notifications: scheduling, grace deferral, posting, withdrawal.
 - `PowerAssertion.swift` — holds AwakeBar's own `PreventUserIdleSystemSleep` assertion.
@@ -48,10 +49,10 @@ Apple's SF Symbols licence bars its symbols from app icons.
 
 ## Gotchas when editing
 
-- **Undocumented Claude Code log strings.** Remote Control and VSCode-prompt
-  detection parse log markers Claude Code doesn't promise to keep. They're
-  centralised in `Contract.swift` *and* its shell mirror `claude-hook-contract.sh`
-  — a Claude Code rename is a one-line fix in each.
+- **Undocumented Claude Code internals.** Remote Control detection reads the
+  `bridgeSessionId` field (it vanished once already) and VSCode-prompt detection
+  parses log markers. Both are centralised in `Contract.swift` *and* its shell
+  mirror `claude-hook-contract.sh` — a rename is a one-line fix in each.
 - **cwd parse anchor.** Only trust `launch_claude` / `Spawning Claude` lines for
   a session's cwd; the log also echoes back tool inputs that mention `cwd:` —
   don't match those.
@@ -83,5 +84,6 @@ The hooks (`notify-attention.sh`, `keep-awake.sh`) talk to the app through marke
 
 - `claude-attention.json` — Claude needs you (`project`/`message`/`cwd`/`ts` dedup key).
 - `claude-done.json` — turn ended (same fields plus `dur`, the turn's length in seconds; `-1` = start not recorded).
+- `claude-keep-awake.d/<session-id>.pid` — one per-session `caffeinate` hold (`<pid> <reason> <session pid>`); the two files below are republished from these.
 - `claude-keep-awake.reason` — why `caffeinate` is running (`turn` | `remote`); drives the **Claude Code Hook** menu wording.
 - `claude-keep-awake.idle` — idle window in seconds that AwakeBar publishes for the hook's between-turns `caffeinate -t` (absent → hook's own 4 h backstop).
