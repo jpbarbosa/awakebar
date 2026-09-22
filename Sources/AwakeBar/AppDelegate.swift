@@ -465,7 +465,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // expands like the other submenus. Its children are readout rows.
             let parent = NSMenuItem(title: "Kept Awake By", action: nil, keyEquivalent: "")
             parent.attributedTitle = infoText("Kept Awake By", color: .secondaryLabelColor)
-            parent.image = spacerSlot()   // align with the dotted status rows' text
+            parent.setLeadingImage(spacerSlot())   // align with the dotted status rows' text
             let sub = NSMenu()
             sub.autoenablesItems = false
             for label in keptAwakeBy {
@@ -546,7 +546,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Power glyph in the shared leading slot — a familiar "turn off" cue.
         let power = NSImage(systemSymbolName: "power", accessibilityDescription: "Quit")?
             .withSymbolConfiguration(.init(pointSize: 12, weight: .semibold))
-        quit.image = leadingSlot(power, template: true)
+        quit.setLeadingImage(leadingSlot(power, template: true))
         menu.addItem(quit)
     }
 
@@ -562,7 +562,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let parent = NSMenuItem(title: "Sessions", action: nil, keyEquivalent: "")
         parent.attributedTitle = infoText("Sessions: \(sessions.count)", color: .secondaryLabelColor)
-        parent.image = spacerSlot()   // align with the dotted status rows' text
+        parent.setLeadingImage(spacerSlot())   // align with the dotted status rows' text
 
         let sub = NSMenu()
         sub.autoenablesItems = false
@@ -710,7 +710,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
         item.target = self
         if !toolTip.isEmpty { item.toolTip = toolTip }
-        item.image = checkmarkSlot(on)
+        item.setLeadingImage(checkmarkSlot(on))
         menu.addItem(item)
         return item
     }
@@ -741,7 +741,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             sub.addItem(item)
         }
         parent.submenu = sub
-        parent.image = spacerSlot()
+        parent.setLeadingImage(spacerSlot())
         menu.addItem(parent)
         return parent
     }
@@ -832,17 +832,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if planLimits.connected {
             item = NSMenuItem(title: "Disconnect Claude Account",
                               action: #selector(disconnectClaudeAccount), keyEquivalent: "")
-            item.image = leadingSlot(NSImage(systemSymbolName: "person.crop.circle.badge.xmark",
+            item.setLeadingImage(leadingSlot(NSImage(systemSymbolName: "person.crop.circle.badge.xmark",
                 accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 12, weight: .regular)),
-                template: true)
+                template: true))
             item.toolTip = "Stop fetching the exact numbers and revert to the local estimate"
         } else {
             item = NSMenuItem(title: planLimits.needsReauth ? "Reconnect Claude Account…"
                                                             : "Connect Claude Account…",
                               action: #selector(connectClaudeAccount), keyEquivalent: "")
-            item.image = leadingSlot(NSImage(systemSymbolName: "person.crop.circle.badge.plus",
+            item.setLeadingImage(leadingSlot(NSImage(systemSymbolName: "person.crop.circle.badge.plus",
                 accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 12, weight: .regular)),
-                template: true)
+                template: true))
             item.toolTip = "Sign in to show your exact Claude plan usage instead of the local estimate"
         }
         item.target = self
@@ -864,7 +864,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let arrow = NSImage(systemSymbolName: "arrow.up.right",
                             accessibilityDescription: "Open on the web")?
             .withSymbolConfiguration(.init(pointSize: 10, weight: .semibold))
-        item.image = leadingSlot(arrow, template: true)
+        item.setLeadingImage(leadingSlot(arrow, template: true))
         item.toolTip = "Open your plan usage on claude.ai"
         return item
     }
@@ -1104,5 +1104,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         remoteAssertion.set(false)   // don't leak assertions
         manualAssertion.set(false)
         NSApp.terminate(nil)
+    }
+}
+
+// MARK: - Menu item images
+
+private extension NSMenuItem {
+    // From macOS 27 AppKit decides whether to draw an item's image, and typically
+    // hides it. Every image this menu sets is load-bearing: checkmarkSlot IS the
+    // on-state (the main menu forgoes .state for one shared leading column) and the
+    // spacers are what hold that column together. So each one asks to stay.
+    func setLeadingImage(_ image: NSImage?) {
+        self.image = image
+        if #available(macOS 27, *) { preferredImageVisibility = .visible }
     }
 }

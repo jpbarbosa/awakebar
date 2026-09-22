@@ -145,7 +145,7 @@ the **Remote Idle Timeout** that caps an abandoned remote session.
 
 ## Build & install
 
-Requires macOS 15+ and Swift 6.2.
+Requires macOS 26+ and Swift 6.2.
 
 ```sh
 ./build.sh

@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "AwakeBar",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS(.v26)],
     targets: [
         .executableTarget(name: "AwakeBar", path: "Sources/AwakeBar"),
         .testTarget(name: "AwakeBarTests", dependencies: ["AwakeBar"],

@@ -1,6 +1,6 @@
 # AwakeBar — working notes
 
-A tiny macOS menu-bar app (Swift 6.2, macOS 15+) that keeps the Mac awake for
+A tiny macOS menu-bar app (Swift 6.2, macOS 26+) that keeps the Mac awake for
 Claude Code sessions and notifies you when Claude is waiting or a task finishes.
 Product docs: [README.md](README.md). Mechanics & rationale: [DESIGN.md](DESIGN.md).
 

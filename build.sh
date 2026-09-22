@@ -13,7 +13,16 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 cp "$BIN" "$APP/Contents/MacOS/AwakeBar"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+# LSMinimumSystemVersion and Package.swift's `platforms:` are the same number in
+# two files, and nothing at build time notices when they disagree - so read it
+# back out of the manifest rather than typing it twice.
+MIN_MACOS=$(sed -nE 's/.*\.macOS\(\.v([0-9]+)\).*/\1.0/p; s/.*\.macOS\("([0-9.]+)"\).*/\1/p' Package.swift)
+if [ -z "$MIN_MACOS" ]; then
+    echo "ERROR: could not read the macOS deployment target from Package.swift" >&2
+    exit 1
+fi
+
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -26,7 +35,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleExecutable</key><string>AwakeBar</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
-    <key>LSMinimumSystemVersion</key><string>15.0</string>
+    <key>LSMinimumSystemVersion</key><string>$MIN_MACOS</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
 </dict>
